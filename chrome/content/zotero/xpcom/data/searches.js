@@ -96,6 +96,29 @@ Zotero.Searches = function() {
 	}
 	
 	
+	this.conditionEquals = function (data1, data2) {
+		return data1.condition === data2.condition
+			&& data1.operator === data2.operator
+			&& data1.value === data2.value;
+	},
+	
+	
+	this.getNextName = async function (libraryID, name) {
+		// Trim '1', etc.
+		var matches = name.match(/^(.+) \d+$/);
+		if (matches) {
+			name = matches[1].trim();
+		}
+		var sql = "SELECT savedSearchName FROM savedSearches "
+			+ "WHERE libraryID=? AND savedSearchName LIKE ? ESCAPE '\\'";
+		var names = await Zotero.DB.columnQueryAsync(
+			sql,
+			[libraryID, Zotero.DB.escapeSQLExpression(name) + '%']
+		);
+		return Zotero.Utilities.Internal.getNextName(name, names, true);
+	};
+	
+	
 	this._loadConditions = Zotero.Promise.coroutine(function* (libraryID, ids, idSQL) {
 		var sql = "SELECT savedSearchID, searchConditionID, condition, operator, value, required "
 			+ "FROM savedSearches LEFT JOIN savedSearchConditions USING (savedSearchID) "
@@ -123,6 +146,11 @@ Zotero.Searches = function() {
 				// Parse "condition[/mode]"
 				let [conditionName, mode] = Zotero.SearchConditions.parseCondition(condition.condition);
 				
+				// Not sure how this can happen, but prevent an error if it does
+				if (condition.value === null) {
+					condition.value = '';
+				}
+				
 				let cond = Zotero.SearchConditions.get(conditionName);
 				if (!cond || cond.noLoad) {
 					Zotero.debug("Invalid saved search condition '" + conditionName + "' -- skipping", 2);
@@ -135,6 +163,13 @@ Zotero.Searches = function() {
 				if (conditionName == 'itemTypeID') {
 					conditionName = 'itemType';
 					condition.value = Zotero.ItemTypes.getName(condition.value);
+				}
+				// Parse old-style collection/savedSearch conditions ('0_ABCD2345' -> 'ABCD2345')
+				else if (conditionName == 'collection' || conditionName == 'savedSearch') {
+					if (condition.value.includes('_')) {
+						let [_, objKey] = condition.value.split('_');
+						condition.value = objKey;
+					}
 				}
 				
 				search._conditions[i] = {

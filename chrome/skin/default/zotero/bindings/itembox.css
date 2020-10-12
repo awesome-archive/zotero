@@ -1,6 +1,7 @@
 #item-box
 {
 	overflow: auto;
+	margin-top: 8px;
 }
 
 row, tagsbox row
@@ -25,9 +26,8 @@ textbox .textbox-input-box
 row > label:first-child, .creator-type-label
 {
 	text-align: right;
-	font-weight: bold;
 	margin-left: 5px !important;
-	margin-right: 0 !important;
+	margin-right: 2px !important;
 }
 
 #more-creators-label
@@ -97,7 +97,6 @@ row > vbox > description
 
 #zotero-date-field-status
 {
-	font-weight: bold;
 	color: #666;
 	padding: 0 10px 0 1px !important;
 }
@@ -112,10 +111,6 @@ row > vbox > description
 	margin: 1px 5px 0 1px !important;
 	max-height: 1.5em !important;
 	border: 1px solid transparent;	
-	-moz-border-top-colors: none;
-	-moz-border-right-colors: none;
-	-moz-border-bottom-colors: none;
-	-moz-border-left-colors: none;
 	background-color: transparent;
 }
 

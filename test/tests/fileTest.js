@@ -48,6 +48,13 @@ describe("Zotero.File", function () {
 			assert.lengthOf(contents, 6);
 			assert.equal(contents, "Zotero");
 		});
+		
+		it("should get a file from a file: URI", function* () {
+			var contents = yield Zotero.File.getContentsAsync(
+				OS.Path.toFileURI(OS.Path.join(getTestDataDirectory().path, "test.txt"))
+			);
+			assert.isTrue(contents.startsWith('Zotero'));
+		});
 	})
 	
 	describe("#getBinaryContentsAsync()", function () {
@@ -74,6 +81,133 @@ describe("Zotero.File", function () {
 			}
 		});
 	});
+	
+	describe("#putContentsAsync()", function () {
+		it("should save a text string", async function () {
+			var tmpDir = await getTempDirectory();
+			var destFile = OS.Path.join(tmpDir, 'test');
+			var str = 'A';
+			await Zotero.File.putContentsAsync(destFile, str);
+			assert.equal(await Zotero.File.getContentsAsync(destFile), str);
+		});
+		
+		it("should save a Blob", async function () {
+			var srcFile = OS.Path.join(getTestDataDirectory().path, 'test.pdf');
+			var tmpDir = await getTempDirectory();
+			var destFile = OS.Path.join(tmpDir, 'test.pdf');
+			
+			var blob = await File.createFromFileName(srcFile);
+			await Zotero.File.putContentsAsync(destFile, blob);
+			
+			var destContents = await Zotero.File.getBinaryContentsAsync(destFile);
+			assert.equal(
+				await Zotero.File.getBinaryContentsAsync(srcFile),
+				destContents
+			);
+			
+			assert.equal(destContents.substr(0, 4), '%PDF');
+		});
+		
+		it("should save via .tmp file", function* () {
+			var tmpDir = yield getTempDirectory();
+			var destFile = OS.Path.join(tmpDir, 'test.txt')
+			var tmpFile = destFile + ".tmp";
+			yield Zotero.File.putContentsAsync(tmpFile, 'A');
+			assert.isTrue(yield OS.File.exists(tmpFile));
+			yield Zotero.File.putContentsAsync(destFile, 'B');
+			assert.isFalse(yield OS.File.exists(tmpFile));
+			// Make sure .tmp file was deleted
+			assert.isFalse(yield OS.File.exists(tmpFile + '.tmp'));
+		});
+	});
+	
+	
+	describe("#rename()", function () {
+		it("should rename a file", async function () {
+			var tmpDir = await getTempDirectory();
+			var sourceFile = OS.Path.join(tmpDir, 'a');
+			var destFile = OS.Path.join(tmpDir, 'b');
+			await Zotero.File.putContentsAsync(sourceFile, '');
+			await Zotero.File.rename(sourceFile, 'b');
+			assert.isTrue(await OS.File.exists(destFile));
+		});
+		
+		// Only relevant on a case-insensitive filesystem
+		it("should rename a file with a case-only change (Mac)", async function () {
+			var tmpDir = await getTempDirectory();
+			var sourceFile = OS.Path.join(tmpDir, 'a');
+			var destFile = OS.Path.join(tmpDir, 'A');
+			await Zotero.File.putContentsAsync(sourceFile, 'foo');
+			var newFilename = await Zotero.File.rename(sourceFile, 'A');
+			assert.equal(newFilename, 'A');
+			assert.equal(await Zotero.File.getContentsAsync(destFile), 'foo');
+		});
+		
+		it("should overwrite an existing file if `overwrite` is true", async function () {
+			var tmpDir = await getTempDirectory();
+			var sourceFile = OS.Path.join(tmpDir, 'a');
+			var destFile = OS.Path.join(tmpDir, 'b');
+			await Zotero.File.putContentsAsync(sourceFile, 'a');
+			await Zotero.File.putContentsAsync(destFile, 'b');
+			await Zotero.File.rename(sourceFile, 'b', { overwrite: true });
+			assert.isTrue(await OS.File.exists(destFile));
+			assert.equal(await Zotero.File.getContentsAsync(destFile), 'a');
+		});
+		
+		it("should get a unique name if target file exists and `unique` is true", async function () {
+			var tmpDir = await getTempDirectory();
+			var sourceFile = OS.Path.join(tmpDir, 'a');
+			var destFile = OS.Path.join(tmpDir, 'b');
+			await Zotero.File.putContentsAsync(sourceFile, 'a');
+			await Zotero.File.putContentsAsync(destFile, 'b');
+			var newFilename = await Zotero.File.rename(sourceFile, 'b', { unique: true });
+			var realDestFile = OS.Path.join(tmpDir, newFilename);
+			assert.equal(newFilename, 'b 2');
+			assert.isTrue(await OS.File.exists(realDestFile));
+			assert.equal(await Zotero.File.getContentsAsync(realDestFile), 'a');
+		});
+	});
+	
+	
+	describe("#getClosestDirectory()", function () {
+		it("should return directory for file that exists", function* () {
+			var tmpDir = yield getTempDirectory();
+			var closest = yield Zotero.File.getClosestDirectory(tmpDir);
+			assert.equal(closest, tmpDir);
+		});
+		
+		it("should return parent directory for missing file", function* () {
+			var tmpDir = yield getTempDirectory();
+			var closest = yield Zotero.File.getClosestDirectory(OS.Path.join(tmpDir, 'a'));
+			assert.equal(closest, tmpDir);
+		});
+		
+		it("should find an existing directory three levels up from a missing file", function* () {
+			var tmpDir = yield getTempDirectory();
+			var closest = yield Zotero.File.getClosestDirectory(OS.Path.join(tmpDir, 'a', 'b', 'c'));
+			assert.equal(closest, tmpDir);
+		});
+		
+		it("should return false for a path that doesn't exist at all", function* () {
+			assert.isFalse(yield Zotero.File.getClosestDirectory('/a/b/c'));
+		});
+	});
+	
+	
+	describe("#moveToUnique", function () {
+		it("should move a file to a unique filename", async function () {
+			var tmpDir = Zotero.getTempDirectory().path;
+			var sourceFile = OS.Path.join(tmpDir, "1");
+			var tmpTargetDir = OS.Path.join(tmpDir, "targetDirectory")
+			var targetFile = OS.Path.join(tmpTargetDir, "file.txt");
+			await OS.File.makeDir(tmpTargetDir);
+			await Zotero.File.putContentsAsync(sourceFile, "");
+			await Zotero.File.putContentsAsync(targetFile, "");
+			var newFile = await Zotero.File.moveToUnique(sourceFile, targetFile);
+			assert.equal(OS.Path.join(tmpTargetDir, 'file-1.txt'), newFile);
+		});
+	});
+	
 	
 	describe("#copyDirectory()", function () {
 		it("should copy all files within a directory", function* () {
@@ -104,6 +238,38 @@ describe("Zotero.File", function () {
 			);
 		})
 	})
+	
+	describe("#createDirectoryIfMissing()", function () {
+		it("should throw error on broken symlink", async function () {
+			if (Zotero.isWin) {
+				this.skip();
+			};
+			
+			var tmpPath = await getTempDirectory();
+			var destPath = OS.Path.join(tmpPath, 'missing');
+			var linkPath = OS.Path.join(tmpPath, 'link');
+			await OS.File.unixSymLink(destPath, linkPath);
+			
+			assert.throws(() => Zotero.File.createDirectoryIfMissing(linkPath), /^Broken symlink/);
+		});
+	});
+	
+	describe("#createDirectoryIfMissingAsync()", function () {
+		it("should throw error on broken symlink", async function () {
+			if (Zotero.isWin) {
+				this.skip();
+			};
+			
+			var tmpPath = await getTempDirectory();
+			var destPath = OS.Path.join(tmpPath, 'missing');
+			var linkPath = OS.Path.join(tmpPath, 'link');
+			await OS.File.unixSymLink(destPath, linkPath);
+			
+			var e = await getPromiseError(Zotero.File.createDirectoryIfMissingAsync(linkPath));
+			assert.ok(e);
+			assert.match(e.message, /^Broken symlink/);
+		});
+	});
 	
 	describe("#zipDirectory()", function () {
 		it("should compress a directory recursively", function* () {
@@ -139,6 +305,29 @@ describe("Zotero.File", function () {
 			assert.notProperty(files, '.zotero-ft-cache');
 			assert.propertyVal(files, 'a.txt', 'A');
 			assert.propertyVal(files, 'sub/b.txt', 'B');
+		});
+	});
+	
+	
+	describe("#checkFileAccessError()", function () {
+		it("should catch OS.File access-denied errors", function* () {
+			// We can't modify a real OS.File.Error, but we also don't do an instanceof check in
+			// checkFileAccessError, so just set the expected properties.
+			var e = {
+				operation: 'open',
+				becauseAccessDenied: true,
+				path: '/tmp/test'
+			};
+			try {
+				Zotero.File.checkFileAccessError(e, e.path, 'create');
+			}
+			catch (e) {
+				if (e instanceof Zotero.Error) {
+					return;
+				}
+				throw e;
+			}
+			throw new Error("Error not thrown");
 		});
 	});
 })

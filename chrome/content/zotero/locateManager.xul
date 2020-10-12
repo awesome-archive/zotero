@@ -26,6 +26,7 @@
 <!DOCTYPE prefwindow SYSTEM "chrome://zotero/locale/preferences.dtd">
 
 <?xml-stylesheet href="chrome://global/skin/global.css"?>
+<?xml-stylesheet href="chrome://zotero-platform/content/preferences.css"?>
 <?xml-stylesheet href="chrome://browser/skin/preferences/preferences.css"?>
 <?xml-stylesheet href="chrome://zotero/skin/preferences.css"?>
 
@@ -89,9 +90,12 @@ To add a new preference:
 		
 			<separator class="thin"/>
 			
+			<!--
+			TODO: Restore a way to add these
 			<label id="addLocateEngineDescription" style="font-size: 10px; width: 45em; height: 6em">
 				&zotero.preferences.locate.addDescription;
 			</label>
+			-->
 		</groupbox>
 	</prefpane>
 	

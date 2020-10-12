@@ -99,16 +99,16 @@ describe("Zotero.FeedItems", function () {
 			ids = Array.map(items, (i) => i.id);
 		});
 		
+		afterEach(function* () {
+			save.resetHistory();
+			
+			yield clearFeeds();
+		});
+		
 		after(function() {
 			save.restore();
 		});
 		
-		afterEach(function* () {
-			save.reset();
-			
-			yield clearFeeds();
-		});
-	
 		it('should toggle all items read if at least one unread', function* () {
 			items[0].isRead = false;
 			yield items[0].saveTx();

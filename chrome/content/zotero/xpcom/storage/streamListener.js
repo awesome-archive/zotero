@@ -102,7 +102,7 @@ Zotero.Sync.Storage.StreamListener.prototype = {
 	// nsIWebProgressListener
 	onProgressChange: function (wp, request, curSelfProgress,
 			maxSelfProgress, curTotalProgress, maxTotalProgress) {
-		Zotero.debug("onProgressChange with " + curTotalProgress + "/" + maxTotalProgress);
+		//Zotero.debug("onProgressChange with " + curTotalProgress + "/" + maxTotalProgress);
 		
 		// onProgress gets called too, so this isn't necessary
 		//this._onProgress(request, curTotalProgress, maxTotalProgress);
@@ -271,6 +271,6 @@ Zotero.Sync.Storage.StreamListener.prototype = {
 	
 	_safeSpec: function (uri) {
 		return uri.scheme + '://' + uri.username + ':********@'
-			+ uri.hostPort + uri.path
+			+ uri.hostPort + uri.pathQueryRef
 	},
 };

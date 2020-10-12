@@ -1,6 +1,17 @@
 describe("Zotero.QuickCopy", function() {
-	var quickCopyPref = Zotero.Prefs.get("export.quickCopy.setting");
-	quickCopyPref = JSON.stringify(Zotero.QuickCopy.unserializeSetting(quickCopyPref));
+	var quickCopyPref;
+	var prefName = "export.quickCopy.setting";
+	
+	before(function* () {
+		yield Zotero.QuickCopy.loadSiteSettings();
+		Zotero.Prefs.clear(prefName);
+		quickCopyPref = Zotero.Prefs.get(prefName);
+		quickCopyPref = JSON.stringify(Zotero.QuickCopy.unserializeSetting(quickCopyPref));
+	});
+	
+	afterEach(function () {
+		Zotero.Prefs.clear(prefName);
+	});
 	
 	// TODO: These should set site-specific prefs and test the actual response against it,
 	// but that will need to wait for 5.0. For now, just make sure they don't fail.
@@ -30,7 +41,7 @@ describe("Zotero.QuickCopy", function() {
 		})
 		
 		it("should handle a chrome URL", function () {
-			assert.deepEqual(Zotero.QuickCopy.getFormatFromURL('chrome://zotero/content/tab.xul'), quickCopyPref);
+			assert.deepEqual(Zotero.QuickCopy.getFormatFromURL('chrome://zotero/content/foo.xul'), quickCopyPref);
 		})
 	})
 	
@@ -44,7 +55,7 @@ describe("Zotero.QuickCopy", function() {
 			
 			var translatorID = '9cb70025-a888-4a29-a210-93ec52da40d4'; // BibTeX
 			var format = 'export=' + translatorID;
-			Zotero.Prefs.set('export.quickCopy.setting', format);
+			Zotero.Prefs.set(prefName, format);
 			// Translator code for selected format is loaded automatically, so wait for it
 			var translator = Zotero.Translators.get(translatorID);
 			while (!translator.code) {
@@ -62,5 +73,42 @@ describe("Zotero.QuickCopy", function() {
 			assert.isTrue(worked);
 			assert.isTrue(content.trim().startsWith('@'));
 		});
+		
+		it("should copy note content", async function () {
+			var item = await createDataObject('item', { itemType: 'note', note: '<p>Foo</p>' });
+			
+			var format = 'bibliography=http://www.zotero.org/styles/apa';
+			Zotero.Prefs.set(prefName, format);
+			
+			var content = Zotero.QuickCopy.getContentFromItems([item], format);
+			assert.propertyVal(content, 'text', 'Foo');
+			assert.propertyVal(content, 'html', '<div class=\"zotero-notes\"><div class=\"zotero-note\"><p>Foo</p></div></div>');
+		});
+	});
+	
+	it("should generate bibliography in default locale if Quick Copy locale not set", async function () {
+		var item = createUnsavedDataObject('item', { itemType: 'webpage', title: 'Foo' });
+		item.setField('date', '2020-03-11');
+		await item.saveTx();
+		var content = "";
+		var worked = false;
+		
+		// Quick Copy locale not set
+		Zotero.Prefs.clear('export.quickCopy.locale');
+		// This shouldn't be used
+		Zotero.Prefs.set('export.lastLocale', 'fr-FR');
+		await Zotero.Styles.init();
+		
+		var format = 'bibliography=http://www.zotero.org/styles/apa';
+		Zotero.Prefs.set(prefName, format);
+		
+		var { text, html } = Zotero.QuickCopy.getContentFromItems([item], format);
+		Zotero.debug(text);
+		Zotero.debug(html);
+		assert.isTrue(text.startsWith('Foo'));
+		assert.include(text, 'March');
+		assert.isTrue(html.startsWith('<div'));
+		assert.include(html, '<i>Foo</i>');
+		assert.include(html, 'March');
 	});
 })

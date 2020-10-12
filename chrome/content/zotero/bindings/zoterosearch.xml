@@ -41,6 +41,12 @@
 		</resources>
 		
 		<implementation>
+			<constructor>
+			<![CDATA[
+				Components.utils.import("resource://gre/modules/Services.jsm");
+			]]>
+			</constructor>
+			
 			<property name="groups"/>
 			
 			<field name="searchRef"/>
@@ -49,7 +55,16 @@
 					<![CDATA[
 						this.searchRef = val;
 						
-						this.buildLibraryMenu();
+						var libraryMenu = this.id('libraryMenu');
+						var libraries = Zotero.Libraries.getAll();
+						Zotero.Utilities.Internal.buildLibraryMenu(
+							libraryMenu, libraries, this.searchRef.libraryID
+						);
+						if (this.searchRef.id) {
+							libraryMenu.disabled = true;
+						}
+						this.updateLibrary();
+						
 						
 						var conditionsBox = this.id('conditions');
 						while(conditionsBox.hasChildNodes())
@@ -80,43 +95,6 @@
 					]]>
 				</setter>
 			</property>
-			
-			<method name="buildLibraryMenu">
-				<body><![CDATA[
-					var menulist = this.id('libraryMenu');
-					var menupopup = menulist.firstChild;
-					
-					while (menupopup.hasChildNodes()) {
-						menupopup.removeChild(menupopup.firstChild);
-					}
-					
-					var libraryID = this.searchRef.libraryID;
-					var libraryIndex = 0;
-					
-					var libraries = Zotero.Libraries.getAll();
-					var selectedIndex = 0;
-					var i = 0;
-					for (let library of libraries) {
-						let menuitem = document.createElement('menuitem');
-						menuitem.setAttribute('label', library.name);
-						menuitem.setAttribute('libraryID', library.libraryID);
-						menupopup.appendChild(menuitem);
-						if (library.libraryID == libraryID) {
-							selectedIndex = i;
-						}
-						i++
-					}
-					
-					menulist.appendChild(menupopup);
-					menulist.selectedIndex = selectedIndex;
-					
-					if (this.searchRef.id) {
-						this.id('libraryMenu').disabled = true;
-					}
-					
-					this.updateLibrary();
-				]]></body>
-			</method>
 			
 			<method name="addCondition">
 				<parameter name="ref"/>
@@ -170,7 +148,7 @@
 			<method name="updateLibrary">
 				<body><![CDATA[
 					var menu = this.id('libraryMenu');
-					var libraryID = parseInt(menu.selectedItem.getAttribute('libraryID'));
+					var libraryID = parseInt(menu.selectedItem.value);
 					
 				 	if (this.onLibraryChange) {
 				 		this.onLibraryChange(libraryID);
@@ -361,7 +339,7 @@
 							if (!this.id(condition.name + '-tooltip')) {
 								var fieldName = null;
 								try {
-									fieldName = Zotero.ItemFields.getLocalizedString(null, condition.name);
+									fieldName = Zotero.ItemFields.getLocalizedString(condition.name);
 								}
 								catch (e) {}
 								
@@ -437,6 +415,7 @@
 				case 'dateModified':
 				case 'itemType':
 				case 'fileTypeID':
+				case 'publicationTitle':
 				case 'tag':
 				case 'note':
 				case 'childNote':
@@ -467,6 +446,10 @@
 					var operators = condition.operators;
 					
 					conditionsMenu.value = conditionName;
+					// Store in attribute as well because the value doesn't get set properly when
+					// the value is from a menuitem in the More menu, and we need this to select
+					// the previous condition when creating a new row
+					conditionsMenu.setAttribute('data-value', conditionName);
 					
 					// Parent state isn't set automatically for submenu selections
 					if (!this.isPrimaryCondition(conditionName)) {
@@ -839,7 +822,14 @@
 				<body>
 					<![CDATA[
 						if (this.parent){
-							this.parent.addCondition();
+							let ref = this.parent.search.getCondition(
+								this.parent.search.addCondition(
+									this.id('conditionsmenu').getAttribute('data-value'),
+									this.id('operatorsmenu').value,
+									""
+								)
+							)
+							this.parent.addCondition(ref);
 							window.sizeToContent();
 						}
 					]]>

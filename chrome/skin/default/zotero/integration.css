@@ -139,14 +139,20 @@
 }
 
 #quick-format-iframe {
+	margin-left: 4px;
 	height: 9999px;
 }
 
 body {
-	margin: 0 2px 0 2px;
-	padding: 0;
+	padding: 0 2px 0 2px;
+	margin: 0;
 	font: -moz-field;
 	overflow: hidden;
+}
+
+#quick-format-spinner {
+	margin-top: 2px;
+	margin-right: 8px;
 }
 
 .quick-format-item {

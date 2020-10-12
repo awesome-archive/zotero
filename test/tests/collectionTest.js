@@ -35,7 +35,32 @@ describe("Zotero.Collection", function() {
 			
 			assert.isTrue((yield Zotero.Items.getAsync(item1.id)).deleted);
 			assert.isTrue((yield Zotero.Items.getAsync(item2.id)).deleted);
-		})
+		});
+		
+		it("should clear collection from item cache", function* () {
+			var collection = yield createDataObject('collection');
+			var item = yield createDataObject('item', { collections: [collection.id] });
+			assert.lengthOf(item.getCollections(), 1);
+			yield collection.eraseTx();
+			assert.lengthOf(item.getCollections(), 0);
+		});
+		
+		it("should clear subcollection from descendent item cache", function* () {
+			var collection = yield createDataObject('collection');
+			var subcollection = yield createDataObject('collection', { parentID: collection.id });
+			var item = yield createDataObject('item', { collections: [subcollection.id] });
+			assert.lengthOf(item.getCollections(), 1);
+			yield collection.eraseTx();
+			assert.lengthOf(item.getCollections(), 0);
+		});
+		
+		it("should clear collection from item cache in deleteItems mode", function* () {
+			var collection = yield createDataObject('collection');
+			var item = yield createDataObject('item', { collections: [collection.id] });
+			assert.lengthOf(item.getCollections(), 1);
+			yield collection.eraseTx({ deleteItems: true });
+			assert.lengthOf(item.getCollections(), 0);
+		});
 	})
 	
 	describe("#version", function () {
@@ -168,6 +193,17 @@ describe("Zotero.Collection", function() {
 			var childCollections = collection1.getChildCollections();
 			assert.lengthOf(childCollections, 0);
 		})
+		
+		it("should not include collections that have been deleted", function* () {
+			var collection1 = yield createDataObject('collection');
+			var collection2 = yield createDataObject('collection', { parentID: collection1.id });
+			yield collection1.saveTx();
+			
+			yield collection2.eraseTx()
+			
+			var childCollections = collection1.getChildCollections();
+			assert.lengthOf(childCollections, 0);
+		})
 	})
 	
 	describe("#getChildItems()", function () {
@@ -199,7 +235,55 @@ describe("Zotero.Collection", function() {
 			
 			assert.lengthOf(collection.getChildItems(false, true), 1);
 		})
+		
+		it("should not include removed items", function* () {
+			var col = yield createDataObject('collection');
+			var item = yield createDataObject('item', { collections: [ col.id ] });
+			assert.lengthOf(col.getChildItems(), 1);
+			item.setCollections([]);
+			yield item.saveTx();
+			Zotero.debug(col.getChildItems());
+			assert.lengthOf(col.getChildItems(), 0);
+		});
+		
+		it("should not include deleted items", function* () {
+			var col = yield createDataObject('collection');
+			var item = yield createDataObject('item', { collections: [ col.id ] });
+			assert.lengthOf(col.getChildItems(), 1);
+			yield item.erase();
+			assert.lengthOf(col.getChildItems(), 0);
+		});
+		
+		it("should not include items emptied from trash", function* () {
+			var col = yield createDataObject('collection');
+			var item = yield createDataObject('item', { collections: [ col.id ], deleted: true });
+			yield item.erase();
+			assert.lengthOf(col.getChildItems(), 0);
+		});
 	})
+	
+	describe("#fromJSON()", function () {
+		it("should ignore unknown property in non-strict mode", function () {
+			var json = {
+				name: "Collection",
+				foo: "Bar"
+			};
+			var s = new Zotero.Collection();
+			s.fromJSON(json);
+		});
+		
+		it("should throw on unknown property in strict mode", function () {
+			var json = {
+				name: "Collection",
+				foo: "Bar"
+			};
+			var s = new Zotero.Collection();
+			var f = () => {
+				s.fromJSON(json, { strict: true });
+			};
+			assert.throws(f, /^Unknown collection property/);
+		});
+	});
 	
 	describe("#toJSON()", function () {
 		it("should set 'parentCollection' to false when cleared", function* () {
@@ -265,5 +349,14 @@ describe("Zotero.Collection", function() {
 				]
 			);
 		});
+		
+		it("should not include deleted items", function* () {
+			var col = yield createDataObject('collection');
+			var item = yield createDataObject('item', { collections: [col.id] });
+			assert.lengthOf(col.getDescendents(), 1);
+			yield item.eraseTx();
+			assert.lengthOf(col.getDescendents(), 0);
+		});
+
 	});
 })

@@ -11,13 +11,42 @@ Zotero.Sync.Storage.Local = {
 	
 	lastFullFileCheck: {},
 	uploadCheckFiles: [],
+	storageRemainingForLibrary: new Map(),
+	
+	init: function () {
+		Zotero.Notifier.registerObserver(this, ['group'], 'storageLocal');
+	},
+	
+	notify: async function (action, type, ids, _extraData) {
+		// Clean up cache on group deletion
+		if (action == 'delete' && type == 'group') {
+			for (let libraryID of ids) {
+				if (this.lastFullFileCheck[libraryID]) {
+					delete this.lastFullFileCheck[libraryID];
+				}
+				if (this.storageRemainingForLibrary.has(libraryID)) {
+					this.storageRemainingForLibrary.delete(libraryID);
+				}
+			}
+		}
+	},
 	
 	getEnabledForLibrary: function (libraryID) {
+		// The user must have synced for the first time before we allow storage requests.
+		// This is relevant if an account is set up for syncing but the DB file is cleared and the
+		// user double-clicks on a missing file in download-as-needed mode.
+		if (!Zotero.Users.getCurrentUserID()) {
+			return false;
+		}
 		var libraryType = Zotero.Libraries.get(libraryID).libraryType;
 		switch (libraryType) {
 		case 'user':
-		case 'publications':
 			return Zotero.Prefs.get("sync.storage.enabled");
+		
+		// TEMP: Always sync publications files, at least until we have a better interface for
+		// setting library-specific settings
+		case 'publications':
+			return true;
 		
 		case 'group':
 			return Zotero.Prefs.get("sync.storage.groups.enabled");
@@ -38,11 +67,12 @@ Zotero.Sync.Storage.Local = {
 		var libraryType = Zotero.Libraries.get(libraryID).libraryType;
 		switch (libraryType) {
 		case 'user':
-		case 'publications':
-		case 'feed':
 			return Zotero.Prefs.get("sync.storage.protocol") == 'webdav' ? 'webdav' : 'zfs';
 		
+		case 'publications':
 		case 'group':
+		// TODO: Remove after making sure this is never called for feed libraries
+		case 'feed':
 			return 'zfs';
 		
 		default:
@@ -253,15 +283,25 @@ Zotero.Sync.Storage.Local = {
 		//Zotero.debug("Memory usage: " + memmgr.resident);
 		
 		var changed = false;
-		for (let i = 0; i < items.length; i++) {
-			let item = items[i];
+		var statesToSet = {};
+		for (let item of items) {
 			// TODO: Catch error?
 			let state = yield this._checkForUpdatedFile(item, attachmentData[item.id]);
 			if (state !== false) {
-				item.attachmentSyncState = state;
-				yield item.saveTx({ skipAll: true });
+				if (!statesToSet[state]) {
+					statesToSet[state] = [];
+				}
+				statesToSet[state].push(item);
 				changed = true;
 			}
+		}
+		// Update sync states in bulk
+		if (changed) {
+			yield Zotero.DB.executeTransaction(function* () {
+				for (let state in statesToSet) {
+					yield this.updateSyncStates(statesToSet[state], parseInt(state));
+				}
+			}.bind(this));
 		}
 		
 		if (!items.length) {
@@ -274,7 +314,7 @@ Zotero.Sync.Storage.Local = {
 	}),
 	
 	
-	_checkForUpdatedFile: Zotero.Promise.coroutine(function* (item, attachmentData, remoteModTime) {
+	_checkForUpdatedFile: Zotero.Promise.coroutine(function* (item, attachmentData) {
 		var lk = item.libraryKey;
 		Zotero.debug("Checking attachment file for item " + lk, 4);
 		
@@ -310,25 +350,7 @@ Zotero.Sync.Storage.Local = {
 			//Zotero.debug("Stored mtime is " + attachmentData.mtime);
 			//Zotero.debug("File mtime is " + fmtime);
 			
-			//BAIL AFTER DOWNLOAD MARKING MODE, OR CHECK LOCAL?
 			let mtime = attachmentData ? attachmentData.mtime : false;
-			
-			// Download-marking mode
-			if (remoteModTime) {
-				Zotero.debug(`Remote mod time for item ${lk} is ${remoteModTime}`);
-				
-				// Ignore attachments whose stored mod times haven't changed
-				mtime = mtime !== false ? mtime : item.attachmentSyncedModificationTime;
-				if (mtime == remoteModTime) {
-					Zotero.debug(`Synced mod time (${mtime}) hasn't changed for item ${lk}`);
-					return false;
-				}
-				
-				Zotero.debug(`Marking attachment ${lk} for download (stored mtime: ${mtime})`);
-				// DEBUG: Always set here, or allow further steps?
-				return this.SYNC_STATE_FORCE_DOWNLOAD;
-			}
-			
 			var same = !this.checkFileModTime(item, fmtime, mtime);
 			if (same) {
 				Zotero.debug("File has not changed");
@@ -352,7 +374,7 @@ Zotero.Sync.Storage.Local = {
 					yield OS.File.setDates(path, null, mtime);
 				}
 				catch (e) {
-					Zotero.File.checkPathAccessError(e, path, 'update');
+					Zotero.File.checkFileAccessError(e, path, 'update');
 				}
 				return false;
 			}
@@ -363,27 +385,39 @@ Zotero.Sync.Storage.Local = {
 			return this.SYNC_STATE_TO_UPLOAD;
 		}
 		catch (e) {
-			if (e instanceof OS.File.Error &&
-					(e.becauseNoSuchFile
-					// This can happen if a path is too long on Windows,
-					// e.g. a file is being accessed on a VM through a share
-					// (and probably in other cases).
-					|| (e.winLastError && e.winLastError == 3)
-					// Handle long filenames on OS X/Linux
-					|| (e.unixErrno && e.unixErrno == 63))) {
-				Zotero.debug("Marking attachment " + lk + " as missing");
-				return this.SYNC_STATE_TO_DOWNLOAD;
-			}
-			
 			if (e instanceof OS.File.Error) {
+				let missing = e.becauseNoSuchFile
+					// ERROR_PATH_NOT_FOUND: This can happen if a path is too long on Windows, e.g. a
+					// file is being accessed on a VM through a share (and probably in other cases)
+					|| e.winLastError == 3
+					// ERROR_INVALID_NAME: This can happen if there's a colon in the name from before
+					// we were filtering
+					|| e.winLastError == 123
+					// ERROR_BAD_PATHNAME
+					|| e.winLastError == 161;
+				if (!missing) {
+					Components.classes["@mozilla.org/net/osfileconstantsservice;1"]
+						.getService(Components.interfaces.nsIOSFileConstantsService)
+						.init();
+					missing = e.unixErrno == OS.Constants.libc.ENOTDIR
+						// Handle long filenames on OS X/Linux
+						|| e.unixErrno == OS.Constants.libc.ENAMETOOLONG;
+				}
+				if (missing) {
+					if (!e.becauseNoSuchFile) {
+						Zotero.debug(e, 1);
+					}
+					Zotero.debug("Marking attachment " + lk + " as missing");
+					return this.SYNC_STATE_TO_DOWNLOAD;
+				}
 				if (e.becauseClosed) {
 					Zotero.debug("File was closed", 2);
 				}
-				Zotero.debug(e);
-				Zotero.debug(e.toString());
-				throw new Error(`Error for operation '${e.operation}' for ${path}`);
+				Zotero.debug(e, 1);
+				Zotero.debug(e.unixErrno, 1);
+				Zotero.debug(e.winLastError, 1);
+				throw new Error(`Error for operation '${e.operation}' for ${path}: ${e}`);
 			}
-			
 			throw e;
 		}
 		finally {
@@ -410,17 +444,13 @@ Zotero.Sync.Storage.Local = {
 		}
 		// Compare floored timestamps for filesystems that don't support millisecond
 		// precision (e.g., HFS+)
-		else if (Math.floor(mtime / 1000) * 1000 == fmtime
-				|| Math.floor(fmtime / 1000) * 1000 == mtime) {
+		else if (Math.floor(mtime / 1000) == Math.floor(fmtime / 1000)) {
 			Zotero.debug(`File mod times for ${libraryKey} are within one-second precision `
-				+ "(" + fmtime + " ≅ " + mtime + ") -- skipping");
+				+ "(" + fmtime + " \u2248 " + mtime + ") -- skipping");
 		}
 		// Allow timestamp to be exactly one hour off to get around time zone issues
 		// -- there may be a proper way to fix this
-		else if (Math.abs(fmtime - mtime) == 3600000
-				// And check with one-second precision as well
-				|| Math.abs(fmtime - Math.floor(mtime / 1000) * 1000) == 3600000
-				|| Math.abs(Math.floor(fmtime / 1000) * 1000 - mtime) == 3600000) {
+		else if (Math.abs(Math.floor(fmtime / 1000) - Math.floor(mtime / 1000)) == 3600) {
 			Zotero.debug(`File mod time (${fmtime}) for {$libraryKey} is exactly one hour off `
 				+ `remote file (${mtime}) -- assuming time zone issue and skipping`);
 		}
@@ -495,29 +525,63 @@ Zotero.Sync.Storage.Local = {
 	
 	
 	/**
+	 * @param {Zotero.Item[]} items
+	 * @param {String|Integer} syncState
+	 * @return {Promise}
+	 */
+	updateSyncStates: function (items, syncState) {
+		if (syncState === undefined) {
+			throw new Error("Sync state not specified");
+		}
+		if (typeof syncState == 'string') {
+			syncState = this["SYNC_STATE_" + syncState.toUpperCase()];
+		}
+		return Zotero.Utilities.Internal.forEachChunkAsync(
+			items,
+			1000,
+			async function (chunk) {
+				chunk.forEach((item) => {
+					item._attachmentSyncState = syncState;
+				});
+				return Zotero.DB.queryAsync(
+					"UPDATE itemAttachments SET syncState=? WHERE itemID IN "
+						+ "(" + chunk.map(item => item.id).join(', ') + ")",
+					syncState
+				);
+			}
+		);
+	},
+	
+	
+	/**
 	 * Mark all stored files for upload checking
 	 *
 	 * This is used when switching between storage modes in the preferences so that all existing files
 	 * are uploaded via the new mode if necessary.
 	 */
-	resetModeSyncStates: Zotero.Promise.coroutine(function* () {
-		var sql = "SELECT itemID FROM items JOIN itemAttachments USING (itemID) "
-			+ "WHERE libraryID=? AND itemTypeID=? AND linkMode IN (?, ?)";
-		var params = [
-			Zotero.Libraries.userLibraryID,
-			Zotero.ItemTypes.getID('attachment'),
-			Zotero.Attachments.LINK_MODE_IMPORTED_FILE,
-			Zotero.Attachments.LINK_MODE_IMPORTED_URL,
-		];
-		var itemIDs = yield Zotero.DB.columnQueryAsync(sql, params);
-		for (let itemID of itemIDs) {
-			let item = Zotero.Items.get(itemID);
-			item._attachmentSyncState = this.SYNC_STATE_TO_UPLOAD;
+	resetAllSyncStates: async function (libraryID) {
+		if (!libraryID) {
+			throw new Error("libraryID not provided");
 		}
 		
-		sql = "UPDATE itemAttachments SET syncState=? WHERE itemID IN (" + sql + ")";
-		yield Zotero.DB.queryAsync(sql, [this.SYNC_STATE_TO_UPLOAD].concat(params));
-	}),
+		return Zotero.DB.executeTransaction(async function () {
+			var sql = "SELECT itemID FROM items JOIN itemAttachments USING (itemID) "
+				+ "WHERE libraryID=? AND itemTypeID=? AND linkMode IN (?, ?)";
+			var params = [
+				libraryID,
+				Zotero.ItemTypes.getID('attachment'),
+				Zotero.Attachments.LINK_MODE_IMPORTED_FILE,
+				Zotero.Attachments.LINK_MODE_IMPORTED_URL,
+			];
+			var itemIDs = await Zotero.DB.columnQueryAsync(sql, params);
+			for (let itemID of itemIDs) {
+				let item = Zotero.Items.get(itemID);
+				item._attachmentSyncState = this.SYNC_STATE_TO_UPLOAD;
+			}
+			sql = "UPDATE itemAttachments SET syncState=? WHERE itemID IN (" + sql + ")";
+			await Zotero.DB.queryAsync(sql, [this.SYNC_STATE_TO_UPLOAD].concat(params));
+		}.bind(this));
+	},
 	
 	
 	/**
@@ -599,13 +663,13 @@ Zotero.Sync.Storage.Local = {
 			if (!md5) {
 				md5 = yield item.attachmentHash;
 			}
+			
+			// Set the file mtime to the time from the server
+			yield OS.File.setDates(path, null, new Date(parseInt(mtime)));
 		}
 		catch (e) {
 			Zotero.File.checkFileAccessError(e, path, 'update');
 		}
-		
-		// Set the file mtime to the time from the server
-		yield OS.File.setDates(path, null, new Date(parseInt(mtime)));
 		
 		item.attachmentSyncedModificationTime = mtime;
 		item.attachmentSyncedHash = md5;
@@ -626,55 +690,49 @@ Zotero.Sync.Storage.Local = {
 			throw new Error("Downloaded file not found");
 		}
 		
-		var parentDirPath = Zotero.Attachments.getStorageDirectory(item).path;
-		if (!(yield OS.File.exists(parentDirPath))) {
-			yield Zotero.Attachments.createDirectoryForItem(item);
-		}
+		yield Zotero.Attachments.createDirectoryForItem(item);
 		
-		yield this._deleteExistingAttachmentFiles(item);
-		
-		var path = item.getFilePath();
-		if (!path) {
-			throw new Error("Empty path for item " + item.key);
+		var filename = item.attachmentFilename;
+		if (!filename) {
+			Zotero.debug("Empty filename for item " + item.key, 2);
 		}
 		// Don't save Windows aliases
-		if (path.endsWith('.lnk')) {
+		if (filename.endsWith('.lnk')) {
 			return false;
 		}
 		
-		var dir = OS.Path.dirname(path);
-		var fileName = OS.Path.basename(path);
+		var attachmentDir = Zotero.Attachments.getStorageDirectory(item).path;
 		var renamed = false;
 		
 		// Make sure the new filename is valid, in case an invalid character made it over
 		// (e.g., from before we checked for them)
-		var filteredName = Zotero.File.getValidFileName(fileName);
-		if (filteredName != fileName) {
-			Zotero.debug("Filtering filename '" + fileName + "' to '" + filteredName + "'");
-			fileName = filteredName;
-			path = OS.Path.join(dir, fileName);
+		var filteredFilename = Zotero.File.getValidFileName(filename);
+		if (filteredFilename != filename) {
+			Zotero.debug("Filtering filename '" + filename + "' to '" + filteredFilename + "'");
+			filename = filteredFilename;
 			renamed = true;
 		}
+		var path = OS.Path.join(attachmentDir, filename);
 		
 		Zotero.debug("Moving download file " + OS.Path.basename(tempFilePath)
-			+ " into attachment directory as '" + fileName + "'");
+			+ ` into attachment directory as '${filename}'`);
 		try {
-			var finalFileName = Zotero.File.createShortened(
-				path, Components.interfaces.nsIFile.NORMAL_FILE_TYPE, 0644
+			var finalFilename = Zotero.File.createShortened(
+				path, Components.interfaces.nsIFile.NORMAL_FILE_TYPE, 0o644
 			);
 		}
 		catch (e) {
 			Zotero.File.checkFileAccessError(e, path, 'create');
 		}
 		
-		if (finalFileName != fileName) {
-			Zotero.debug("Changed filename '" + fileName + "' to '" + finalFileName + "'");
+		if (finalFilename != filename) {
+			Zotero.debug("Changed filename '" + filename + "' to '" + finalFilename + "'");
 			
-			fileName = finalFileName;
-			path = OS.Path.join(dir, fileName);
+			filename = finalFilename;
+			path = OS.Path.join(attachmentDir, filename);
 			
 			// Abort if Windows path limitation would cause filenames to be overly truncated
-			if (Zotero.isWin && fileName.length < 40) {
+			if (Zotero.isWin && filename.length < 40) {
 				try {
 					yield OS.File.remove(path);
 				}
@@ -741,16 +799,12 @@ Zotero.Sync.Storage.Local = {
 		}
 		
 		var parentDir = Zotero.Attachments.getStorageDirectory(item).path;
-		if (!(yield OS.File.exists(parentDir))) {
-			yield Zotero.Attachments.createDirectoryForItem(item);
-		}
-		
 		try {
-			yield this._deleteExistingAttachmentFiles(item);
+			yield Zotero.Attachments.createDirectoryForItem(item);
 		}
 		catch (e) {
 			zipReader.close();
-			throw (e);
+			throw e;
 		}
 		
 		var returnFile = null;
@@ -781,12 +835,11 @@ Zotero.Sync.Storage.Local = {
 				Zotero.debug("Skipping directory " + filePath);
 				continue;
 			}
-			
 			count++;
 			
 			Zotero.debug("Extracting " + filePath);
 			
-			var primaryFile = false;
+			var primaryFile = itemFileName == filePath;
 			var filtered = false;
 			var renamed = false;
 			
@@ -813,10 +866,10 @@ Zotero.Sync.Storage.Local = {
 					filePath = itemFileName;
 					destPath = OS.Path.join(OS.Path.dirname(destPath), itemFileName);
 					renamed = true;
+					primaryFile = true;
 				}
 			}
 			
-			var primaryFile = itemFileName == filePath;
 			if (primaryFile && filtered) {
 				renamed = true;
 			}
@@ -831,7 +884,7 @@ Zotero.Sync.Storage.Local = {
 			let shortened;
 			try {
 				shortened = Zotero.File.createShortened(
-					destPath, Components.interfaces.nsIFile.NORMAL_FILE_TYPE, 0644
+					destPath, Components.interfaces.nsIFile.NORMAL_FILE_TYPE, 0o644
 				);
 			}
 			catch (e) {
@@ -879,7 +932,7 @@ Zotero.Sync.Storage.Local = {
 				// For advertising junk files, ignore a bug on Windows where
 				// destFile.create() works but zipReader.extract() doesn't
 				// when the path length is close to 255.
-				if (destFile.leafName.match(/[a-zA-Z0-9+=]{130,}/)) {
+				if (OS.Path.basename(destPath).match(/[a-zA-Z0-9+=]{130,}/)) {
 					var msg = "Ignoring error extracting '" + destPath + "'";
 					Zotero.debug(msg, 2);
 					Zotero.debug(e, 2);
@@ -892,7 +945,7 @@ Zotero.Sync.Storage.Local = {
 				Zotero.File.checkFileAccessError(e, destPath, 'create');
 			}
 			
-			yield OS.File.setPermissions(destPath, { unixMode: 0o644 });
+			yield Zotero.File.setNormalFilePermissions(destPath);
 			
 			// If we're renaming the main file, processDownload() needs to know
 			if (renamed) {
@@ -903,17 +956,6 @@ Zotero.Sync.Storage.Local = {
 		zipFile.remove(false);
 		
 		return returnFile;
-	}),
-	
-	
-	_deleteExistingAttachmentFiles: Zotero.Promise.method(function (item) {
-		var parentDir = Zotero.Attachments.getStorageDirectory(item).path;
-		// OS.File.DirectoryIterator, used by OS.File.removeDir(), isn't reliable on Travis,
-		// returning entry.isDir == false for subdirectories, so use nsIFile instead
-		if (Zotero.automatedTest) {
-			Zotero.File.pathToFile(parentDir).remove(true);
-		}
-		return OS.File.removeDir(parentDir);
 	}),
 	
 	
@@ -958,7 +1000,9 @@ Zotero.Sync.Storage.Local = {
 				continue;
 			}
 			remoteItemJSON = remoteItemJSON.data;
-			remoteItemJSON.dateModified = Zotero.Date.dateToISO(new Date(remoteItemJSON.mtime));
+			if (remoteItemJSON.mtime) {
+				remoteItemJSON.dateModified = Zotero.Date.dateToISO(new Date(remoteItemJSON.mtime));
+			}
 			items.push({
 				libraryID,
 				left: localItemJSON,
@@ -976,6 +1020,7 @@ Zotero.Sync.Storage.Local = {
 		if (!conflicts.length) return false;
 		
 		Zotero.debug("Reconciling conflicts for " + Zotero.Libraries.get(libraryID).name);
+		Zotero.debug(conflicts);
 		
 		var io = {
 			dataIn: {
@@ -997,19 +1042,34 @@ Zotero.Sync.Storage.Local = {
 		if (!io.dataOut) {
 			return false;
 		}
+		
 		yield Zotero.DB.executeTransaction(function* () {
 			for (let i = 0; i < conflicts.length; i++) {
 				let conflict = conflicts[i];
-				let mtime = io.dataOut[i].dateModified;
+				// TEMP
+				Zotero.debug(conflict);
+				let item = Zotero.Items.getByLibraryAndKey(libraryID, conflict.left.key);
+				let mtime = io.dataOut[i].data.dateModified;
 				// Local
 				if (mtime == conflict.left.dateModified) {
 					syncState = this.SYNC_STATE_FORCE_UPLOAD;
+					// When local version is chosen, update stored mtime and hash to remote values
+					// so that upload goes through without a 412.
+					//
+					// These sometimes might not be set in the cached JSON (for unclear reasons, but
+					// see https://forums.zotero.org/discussion/79011/zotero-error-report), in which
+					// case we just ignore them and hope that the local version has null values too.
+					if (conflict.right.mtime) {
+						item.attachmentSyncedModificationTime = conflict.right.mtime;
+					}
+					if (conflict.right.md5) {
+						item.attachmentSyncedHash = conflict.right.md5;
+					}
 				}
 				// Remote
 				else {
 					syncState = this.SYNC_STATE_FORCE_DOWNLOAD;
 				}
-				let item = Zotero.Items.getByLibraryAndKey(libraryID, conflict.left.key);
 				item.attachmentSyncState = syncState;
 				yield item.save({ skipAll: true });
 			}

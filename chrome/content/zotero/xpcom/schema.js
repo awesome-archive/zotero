@@ -24,19 +24,35 @@
 */
 
 Zotero.Schema = new function(){
-	this.skipDefaultData = false;
 	this.dbInitialized = false;
 	this.goToChangeLog = false;
+	
+	this.REPO_UPDATE_PERIODIC = 0;
+	this.REPO_UPDATE_MANUAL = 1;
+	this.REPO_UPDATE_INITIAL = 2;
+	this.REPO_UPDATE_STARTUP = 3;
+	this.REPO_UPDATE_NOTIFICATION = 4;
 	
 	var _schemaUpdateDeferred = Zotero.Promise.defer();
 	this.schemaUpdatePromise = _schemaUpdateDeferred.promise;
 	
+	const REPOSITORY_CHECK_INTERVAL = 86400;
+	const REPOSITORY_RETRY_INTERVAL = 3600;
+	
+	// If updating from this userdata version or later, don't show "Upgrading database…" and don't make
+	// DB backup first. This should be set to false when breaking compatibility or making major changes.
+	const minorUpdateFrom = 107;
+	
 	var _dbVersions = [];
 	var _schemaVersions = [];
 	// Update when adding _updateCompatibility() line to schema update step
-	var _maxCompatibility = 3;
-	var _repositoryTimer;
-	var _remoteUpdateInProgress = false, _localUpdateInProgress = false;
+	var _maxCompatibility = 6;
+	
+	var _repositoryTimerID;
+	var _repositoryNotificationTimerID;
+	var _nextRepositoryUpdate;
+	var _remoteUpdateInProgress = false;
+	var _localUpdateInProgress = false;
 	
 	var self = this;
 	
@@ -72,7 +88,7 @@ Zotero.Schema = new function(){
 	/*
 	 * Checks if the DB schema exists and is up-to-date, updating if necessary
 	 */
-	this.updateSchema = Zotero.Promise.coroutine(function* () {
+	this.updateSchema = async function (options = {}) {
 		// TODO: Check database integrity first with Zotero.DB.integrityCheck()
 		
 		// 'userdata' is the last upgrade step run in _migrateUserDataSchema() based on the
@@ -80,7 +96,7 @@ Zotero.Schema = new function(){
 		//
 		// 'compatibility' is incremented manually by upgrade steps in order to break DB
 		// compatibility with older versions.
-		var versions = yield Zotero.Promise.all([
+		var versions = await Zotero.Promise.all([
 			this.getDBVersion('userdata'), this.getDBVersion('compatibility')
 		]);
 		var [userdata, compatibility] = versions;
@@ -88,15 +104,21 @@ Zotero.Schema = new function(){
 			Zotero.debug('Database does not exist -- creating\n');
 			return _initializeSchema()
 			.then(function() {
-				Zotero.initializationPromise
-				.then(1000)
-				.then(function () {
-					return Zotero.Schema.updateBundledFiles();
-				})
-				.then(function () {
+				(Zotero.isStandalone ? Zotero.uiReadyPromise : Zotero.initializationPromise)
+				.delay(1000)
+				.then(async function () {
+					await this.updateBundledFiles();
+					if (Zotero.Prefs.get('automaticScraperUpdates')) {
+						try {
+							await this.updateFromRepository(this.REPO_UPDATE_INITIAL);
+						}
+						catch (e) {
+							Zotero.logError(e);
+						}
+					}
 					_schemaUpdateDeferred.resolve(true);
-				});
-			});
+				}.bind(this))
+			}.bind(this));
 		}
 		
 		// We don't handle upgrades from pre-Zotero 2.1 databases
@@ -107,7 +129,7 @@ Zotero.Schema = new function(){
 		}
 		
 		if (compatibility > _maxCompatibility) {
-			let dbClientVersion = yield Zotero.DB.valueQueryAsync(
+			let dbClientVersion = await Zotero.DB.valueQueryAsync(
 				"SELECT value FROM settings "
 				+ "WHERE setting='client' AND key='lastCompatibleVersion'"
 			);
@@ -116,42 +138,83 @@ Zotero.Schema = new function(){
 			throw new Zotero.DB.IncompatibleVersionException(msg, dbClientVersion);
 		}
 		
-		var schemaVersion = yield _getSchemaSQLVersion('userdata');
+		// Check if DB is coming from the DB Repair Tool and should be checked
+		var integrityCheck = await this.integrityCheckRequired();
 		
-		// If upgrading userdata, make backup of database first
-		if (userdata < schemaVersion) {
-			yield Zotero.DB.backupDatabase(userdata, true);
+		// Check whether bundled global schema file is newer than DB
+		var bundledGlobalSchema = await _readGlobalSchemaFromFile();
+		var bundledGlobalSchemaVersionCompare = await _globalSchemaVersionCompare(
+			bundledGlobalSchema.version
+		);
+		
+		// Check whether bundled userdata schema has been updated
+		var userdataVersion = await _getSchemaSQLVersion('userdata');
+		options.minor = minorUpdateFrom && userdata >= minorUpdateFrom;
+		
+		// If non-minor userdata upgrade, make backup of database first
+		if (userdata < userdataVersion && !options.minor) {
+			await Zotero.DB.backupDatabase(userdata, true);
+		}
+		// Automatic backup
+		else if (integrityCheck || bundledGlobalSchemaVersionCompare === 1) {
+			await Zotero.DB.backupDatabase(false, true);
 		}
 		
-		yield Zotero.DB.queryAsync("PRAGMA foreign_keys = false");
+		await Zotero.DB.queryAsync("PRAGMA foreign_keys = false");
 		try {
-			var updated = yield Zotero.DB.executeTransaction(function* (conn) {
-				var updated = yield _updateSchema('system');
+			// If bundled global schema file is newer than DB, apply it
+			if (bundledGlobalSchemaVersionCompare === 1) {
+				await Zotero.DB.executeTransaction(async function () {
+					await _updateGlobalSchema(bundledGlobalSchema);
+				});
+			}
+			else {
+				let data;
+				// If bundled global schema is up to date, use it
+				if (bundledGlobalSchemaVersionCompare === 0) {
+					data = bundledGlobalSchema;
+				}
+				// If bundled global schema is older than the DB (because of a downgrade), use the
+				// DB version, which will match the mapping tables
+				else if (bundledGlobalSchemaVersionCompare === -1) {
+					data = await _readGlobalSchemaFromDB();
+				}
+				await _loadGlobalSchema(data, bundledGlobalSchema.version);
+			}
+			
+			var updated = await Zotero.DB.executeTransaction(async function (conn) {
+				var updated = await _updateSchema('system');
 				
 				// Update custom tables if they exist so that changes are in
 				// place before user data migration
 				if (Zotero.DB.tableExists('customItemTypes')) {
-					yield _updateCustomTables(updated);
+					await _updateCustomTables();
 				}
-				updated = yield _migrateUserDataSchema(userdata);
-				yield _updateSchema('triggers');
+				
+				// Auto-repair databases flagged for repair or coming from the DB Repair Tool
+				if (integrityCheck) {
+					await this.integrityCheck(true);
+				}
+				
+				updated = await _migrateUserDataSchema(userdata, options);
+				await _updateSchema('triggers');
 				
 				// Populate combined tables for custom types and fields -- this is likely temporary
 				//
 				// We do this again in case custom fields were changed during user data migration
-				yield _updateCustomTables()
+				await _updateCustomTables();
 				
 				return updated;
 			}.bind(this));
 		}
 		finally {
-			yield Zotero.DB.queryAsync("PRAGMA foreign_keys = true");
+			await Zotero.DB.queryAsync("PRAGMA foreign_keys = true");
 		}
 		
 		if (updated) {
 			// Upgrade seems to have been a success -- delete any previous backups
 			var maxPrevious = userdata - 1;
-			var file = Zotero.getZoteroDirectory();
+			var file = Zotero.File.pathToFile(Zotero.DataDirectory.dir);
 			var toDelete = [];
 			try {
 				var files = file.directoryEntries;
@@ -180,19 +243,416 @@ Zotero.Schema = new function(){
 		}
 		
 		// Reset sync queue tries if new version
-		yield _checkClientVersion();
+		await _checkClientVersion();
 		
-		Zotero.initializationPromise
-		.then(1000)
-		.then(function () {
-			return Zotero.Schema.updateBundledFiles();
-		})
-		.then(function () {
-			_schemaUpdateDeferred.resolve(true);
+		// In Standalone, don't load bundled files until after UI is ready. In Firefox, load them as
+		// soon initialization is done so that translation works before the Zotero pane is opened.
+		(Zotero.isStandalone ? Zotero.uiReadyPromise : Zotero.initializationPromise)
+		.then(() => {
+			setTimeout(async function () {
+				try {
+					await this.updateBundledFiles();
+					if (Zotero.Prefs.get('automaticScraperUpdates')) {
+						try {
+							await this.updateFromRepository(this.REPO_UPDATE_STARTUP);
+						}
+						catch (e) {
+							Zotero.logError(e);
+						}
+					}
+					_schemaUpdateDeferred.resolve(true);
+				}
+				catch (e) {
+					// DB corruption already shows an alert
+					if (Zotero.DB.isCorruptionError(e)) {
+						_schemaUpdateDeferred.reject(e);
+						return;
+					}
+					
+					let kbURL = 'https://www.zotero.org/support/kb/unable_to_load_translators_and_styles';
+					let msg = Zotero.getString('startupError.bundledFileUpdateError', Zotero.clientName);
+					
+					let ps = Services.prompt;
+					let buttonFlags = ps.BUTTON_POS_0 * ps.BUTTON_TITLE_IS_STRING
+						+ ps.BUTTON_POS_1 * ps.BUTTON_TITLE_CANCEL
+						+ ps.BUTTON_POS_2 * ps.BUTTON_TITLE_IS_STRING;
+					let index = ps.confirmEx(
+						null,
+						Zotero.getString('general.error'),
+						msg,
+						buttonFlags,
+						Zotero.getString('general.moreInformation'),
+						"",
+						Zotero.getString('errorReport.reportError'),
+						null, {}
+					);
+					
+					_schemaUpdateDeferred.reject(e);
+					
+					if (index == 0) {
+						Zotero.launchURL(kbURL);
+					}
+					else if (index == 2) {
+						setTimeout(function () {
+							Zotero.getActiveZoteroPane().reportErrors();
+						}, 250);
+					}
+				}
+			}.bind(this), 1000);
 		});
 		
 		return updated;
-	});
+	};
+	
+	
+	/**
+	 * Get bundled schema from disk
+	 *
+	 * @return {Object}
+	 */
+	async function _readGlobalSchemaFromFile() {
+		return JSON.parse(
+			await Zotero.File.getResourceAsync('resource://zotero/schema/global/schema.json')
+		);
+	}
+	
+	
+	/**
+	 * Get schema from database
+	 *
+	 * Doesn't include the .itemTypes property, which was already applied to the mapping tables
+	 */
+	async function _readGlobalSchemaFromDB() {
+		var data = await Zotero.DB.valueQueryAsync(
+			"SELECT value FROM settings WHERE setting='globalSchema' AND key='data'"
+		);
+		if (data) {
+			try {
+				let pako = require('pako');
+				return JSON.parse(pako.inflate(data, { to: 'string' }));
+			}
+			catch (e) {
+				Zotero.warn("Unable to extract global schema -- falling back to file: " + e);
+			}
+		}
+		else {
+			Zotero.warn("Global schema not found in DB -- falling back to file");
+		}
+		
+		// If the data is missing or unreadable in the DB for some reason (e.g., DB corruption),
+		// fall back to the file, though it might be out of date
+		data = await _readGlobalSchemaFromFile();
+		
+		return data;
+	}
+	
+	
+	/**
+	 * Compares a given version number to the version of the schema in the database
+	 *
+	 * @return {Number} - 1 if provided version is greater than DB (i.e., DB needs update), 0 if
+	 *     the same, -1 if DB version is newer
+	 */
+	async function _globalSchemaVersionCompare(version) {
+		if (!version) {
+			throw new Error("version not specified");
+		}
+		
+		var dbVersion = await Zotero.Schema.getDBVersion('globalSchema') || null;
+		if (dbVersion > version) {
+			Zotero.debug(`Database has newer global schema (${dbVersion} > ${version}) `
+				+ `-- skipping update and using schema from DB`);
+			return -1;
+		}
+		else if (dbVersion == version) {
+			Zotero.debug(`Database is up to date with global schema version ${version} -- skipping update`);
+			return 0;
+		}
+		
+		Zotero.debug(`Global schema needs update from ${dbVersion} to ${version}`);
+		return 1;
+	}
+	
+	
+	/**
+	 * Update the item-type/field/creator mapping tables based on the passed schema
+	 */
+	async function _updateGlobalSchema(data) {
+		Zotero.debug("Updating global schema to version " + data.version);
+		
+		Zotero.DB.requireTransaction();
+		
+		await Zotero.ID.init();
+		
+		var preItemTypeRows = await Zotero.DB.queryAsync(
+			"SELECT itemTypeID AS id, typeName AS name FROM itemTypes"
+		);
+		var preFieldRows = await Zotero.DB.queryAsync(
+			"SELECT fieldID AS id, fieldName AS name FROM fields"
+		);
+		var preCreatorTypeRows = await Zotero.DB.queryAsync(
+			"SELECT creatorTypeID AS id, creatorType AS name FROM creatorTypes"
+		);
+		var preFields = new Set(preFieldRows.map(x => x.name));
+		var preCreatorTypes = new Set(preCreatorTypeRows.map(x => x.name));
+		var preItemTypeIDsByName = new Map(preItemTypeRows.map(x => [x.name, x.id]));
+		var preFieldIDsByName = new Map(preFieldRows.map(x => [x.name, x.id]));
+		var preCreatorTypeIDsByName = new Map(preCreatorTypeRows.map(x => [x.name, x.id]));
+		var postFields = new Set();
+		var postCreatorTypes = new Set();
+		var postFieldIDsByName = new Map();
+		var postCreatorTypeIDsByName = new Map();
+		
+		// Add new fields and creator types
+		for (let { fields, creatorTypes } of data.itemTypes) {
+			for (let { field, baseField } of fields) {
+				postFields.add(field);
+				if (baseField) {
+					postFields.add(baseField);
+				}
+			}
+			
+			for (let { creatorType } of creatorTypes) {
+				postCreatorTypes.add(creatorType);
+			}
+		}
+		var fieldsValueSets = [];
+		var fieldsParams = [];
+		for (let field of postFields) {
+			if (preFields.has(field)) {
+				postFieldIDsByName.set(field, preFieldIDsByName.get(field));
+			}
+			else {
+				let id = Zotero.ID.get('fields');
+				fieldsValueSets.push("(?, ?, NULL)");
+				fieldsParams.push(id, field);
+				postFieldIDsByName.set(field, id);
+			}
+		}
+		if (fieldsValueSets.length) {
+			await Zotero.DB.queryAsync(
+				"INSERT INTO fields VALUES " + fieldsValueSets.join(", "),
+				fieldsParams
+			);
+		}
+		var creatorTypesValueSets = [];
+		var creatorTypesParams = [];
+		for (let type of postCreatorTypes) {
+			if (preCreatorTypes.has(type)) {
+				postCreatorTypeIDsByName.set(type, preCreatorTypeIDsByName.get(type));
+			}
+			else {
+				let id = Zotero.ID.get('creatorTypes');
+				creatorTypesValueSets.push("(?, ?)");
+				creatorTypesParams.push(id, type);
+				postCreatorTypeIDsByName.set(type, id);
+			}
+		}
+		if (creatorTypesValueSets.length) {
+			await Zotero.DB.queryAsync(
+				"INSERT INTO creatorTypes VALUES " + creatorTypesValueSets.join(", "),
+				creatorTypesParams
+			);
+		}
+		
+		// Apply changes to DB
+		let itemTypeFieldsValueSets = [];
+		let baseFieldMappingsValueSets = [];
+		let itemTypeCreatorTypesValueSets = [];
+		for (let { itemType, fields, creatorTypes } of data.itemTypes) {
+			let itemTypeID = preItemTypeIDsByName.get(itemType);
+			// let preItemTypeCreatorTypeIDs = [];
+			if (itemTypeID) {
+				// Unused
+				/*preItemTypeCreatorTypeIDs = await Zotero.DB.columnQueryAsync(
+					"SELECT creatorTypeID FROM itemTypeCreatorTypes WHERE itemTypeID=?",
+					itemTypeID
+				);*/
+			}
+			// New item type
+			else {
+				itemTypeID = Zotero.ID.get('itemTypes');
+				await Zotero.DB.queryAsync(
+					"INSERT INTO itemTypes VALUES (?, ?, NULL, 1)",
+					[itemTypeID, itemType]
+				);
+			}
+			
+			// Fields
+			let index = 0;
+			let postItemTypeFieldIDs = new Set();
+			for (let { field, baseField } of fields) {
+				let fieldID = postFieldIDsByName.get(field);
+				postItemTypeFieldIDs.add(fieldID);
+				itemTypeFieldsValueSets.push(`(${itemTypeID}, ${fieldID}, 0, ${index++})`);
+				if (baseField) {
+					let baseFieldID = postFieldIDsByName.get(baseField);
+					baseFieldMappingsValueSets.push(`(${itemTypeID}, ${baseFieldID}, ${fieldID})`);
+				}
+			}
+			
+			
+			// TODO: Check for fields removed from this item type
+			// throw new Error(`Field ${id} was removed from ${itemType}`);
+			
+			// Creator types
+			for (let { creatorType, primary } of creatorTypes) {
+				let typeID = postCreatorTypeIDsByName.get(creatorType);
+				itemTypeCreatorTypesValueSets.push(`(${itemTypeID}, ${typeID}, ${primary ? 1 : 0})`);
+			}
+			
+			// TODO: Check for creator types removed from this item type
+			// throw new Error(`Creator type ${id} was removed from ${itemType}`);
+			
+			// TODO: Deal with existing types not in the schema, and their items
+		}
+		
+		await Zotero.DB.queryAsync("DELETE FROM itemTypeFields");
+		await Zotero.DB.queryAsync("DELETE FROM baseFieldMappings");
+		await Zotero.DB.queryAsync("DELETE FROM itemTypeCreatorTypes");
+		
+		await Zotero.DB.queryAsync("INSERT INTO itemTypeFields VALUES "
+			+ itemTypeFieldsValueSets.join(", "));
+		await Zotero.DB.queryAsync("INSERT INTO baseFieldMappings VALUES "
+			+ baseFieldMappingsValueSets.join(", "));
+		await Zotero.DB.queryAsync("INSERT INTO itemTypeCreatorTypes VALUES "
+			+ itemTypeCreatorTypesValueSets.join(", "));
+		
+		// Store data in DB as compressed binary string. This lets us use a schema that matches the
+		// DB tables even if the user downgrades to a version with an earlier bundled schema file.
+		var pako = require('pako');
+		var dbData = { ...data };
+		// Don't include types and fields, which are already in the mapping tables
+		delete dbData.itemTypes;
+		await Zotero.DB.queryAsync(
+			"REPLACE INTO settings VALUES ('globalSchema', 'data', :data)",
+			{ data: pako.deflate(JSON.stringify(dbData)) },
+			{
+				// Hack to pass named parameter to Sqlite.jsm, which in Fx60 treats an object passed
+				// as the the first parameter in a parameter array as an object of named parameters
+				noParseParams: true,
+				debugParams: false
+			}
+		);
+		await _updateDBVersion('globalSchema', data.version);
+		
+		var bundledVersion = (await _readGlobalSchemaFromFile()).version;
+		await _loadGlobalSchema(data, bundledVersion);
+		await _reloadSchema();
+		// Mark that we need to migrate Extra values to any newly available fields in
+		// Zotero.Schema.migrateExtraFields()
+		await Zotero.DB.queryAsync(
+			"REPLACE INTO settings VALUES ('globalSchema', 'migrateExtra', 1)"
+		);
+		
+		return true;
+	}
+	
+	
+	this._updateGlobalSchemaForTest = async function (schema) {
+		await Zotero.DB.executeTransaction(async function () {
+			await _updateGlobalSchema(schema);
+		}.bind(this));
+	};
+	
+	
+	
+	/**
+	 * Set properties on Zotero.Schema based on the passed data
+	 *
+	 * @param {Object} data - Global schema data ('version', 'itemTypes', 'locales', etc.)
+	 * @param {Number} bundledVersion - Version of the bundled schema.json file
+	 */
+	async function _loadGlobalSchema(data, bundledVersion) {
+		if (!data) {
+			throw new Error("Data not provided");
+		}
+		Zotero.Schema.globalSchemaVersion = data.version;
+		var locale = Zotero.Utilities.Internal.resolveLocale(
+			Zotero.locale,
+			Object.keys(data.locales)
+		);
+		Zotero.Schema.globalSchemaLocale = data.locales[locale];
+		Zotero.Schema.globalSchemaMeta = data.meta;
+		
+		//
+		// Keep in sync with the connector's gulpfile.js
+		//
+		
+		// CSL mappings
+		Zotero.Schema.CSL_TYPE_MAPPINGS = {};
+		Zotero.Schema.CSL_TYPE_MAPPINGS_REVERSE = {};
+		for (let cslType in data.csl.types) {
+			for (let zoteroType of data.csl.types[cslType]) {
+				Zotero.Schema.CSL_TYPE_MAPPINGS[zoteroType] = cslType;
+			}
+			// Add the first mapped Zotero type
+			Zotero.Schema.CSL_TYPE_MAPPINGS_REVERSE[cslType] = [...data.csl.types[cslType]];
+		}
+		Zotero.Schema.CSL_TEXT_MAPPINGS = data.csl.fields.text;
+		Zotero.Schema.CSL_DATE_MAPPINGS = data.csl.fields.date;
+		Zotero.Schema.CSL_NAME_MAPPINGS = data.csl.names;
+		
+		// Map Zotero fields to CSL fields
+		Zotero.Schema.CSL_FIELD_MAPPINGS_REVERSE = {};
+		for (let cslField in data.csl.fields.text) {
+			for (let zoteroField of data.csl.fields.text[cslField]) {
+				Zotero.Schema.CSL_FIELD_MAPPINGS_REVERSE[zoteroField] = cslField;
+			}
+		}
+		for (let cslField in data.csl.fields.date) {
+			let zoteroField = data.csl.fields.date[cslField];
+			Zotero.Schema.CSL_FIELD_MAPPINGS_REVERSE[zoteroField] = cslField;
+		}
+	}
+	
+	
+	/**
+	 * Migrate values from item Extra fields that can be moved to regular item fields after a global
+	 * schema update
+	 *
+	 * This needs the data object architecture to be initialized, so it's called from zotero.js
+	 * rather than in _updateGlobalSchema().
+	 */
+	this.migrateExtraFields = async function () {
+		// Check for a flag set by _updateGlobalSchema()
+		var needsUpdate = await Zotero.DB.valueQueryAsync(
+			"SELECT COUNT(*) FROM settings WHERE setting='globalSchema' AND key='migrateExtra'"
+		);
+		if (!needsUpdate) {
+			return;
+		}
+		
+		var fieldID = Zotero.ItemFields.getID('extra');
+		var sql = "SELECT itemID, value FROM itemData "
+			+ "JOIN itemDataValues USING (valueID) "
+			+ "WHERE fieldID=?";
+		var rows = await Zotero.DB.queryAsync(sql, fieldID);
+		var itemIDs = [];
+		for (let row of rows) {
+			let { itemType, fields, creators } = Zotero.Utilities.Internal.extractExtraFields(
+				row.value
+			);
+			if (itemType || fields.size || creators.length) {
+				itemIDs.push(row.itemID);
+			}
+		}
+		
+		var items = await Zotero.Items.getAsync(itemIDs);
+		await Zotero.Items.loadDataTypes(items);
+		for (let item of items) {
+			let changed = item.migrateExtraFields();
+			if (!changed) continue;
+			await item.saveTx({
+				skipDateModifiedUpdate: true,
+				skipSelect: true
+			});
+		}
+		
+		await Zotero.DB.queryAsync(
+			"DELETE FROM settings WHERE setting='globalSchema' AND key='migrateExtra'"
+		);
+	};
 	
 	
 	// https://www.zotero.org/support/nsf
@@ -254,15 +714,15 @@ Zotero.Schema = new function(){
 					
 					switch (fields[i][0]) {
 						case 'name':
-							var baseFieldID = 110; // title
+							var baseFieldID = Zotero.ItemFields.getID('title');
 							break;
 						
 						case 'dateSent':
-							var baseFieldID = 14; // date
+							var baseFieldID = Zotero.ItemFields.getID('date');
 							break;
 						
 						case 'homepage':
-							var baseFieldID = 1; // URL
+							var baseFieldID = Zotero.ItemFields.getID('url');
 							break;
 						
 						default:
@@ -334,72 +794,56 @@ Zotero.Schema = new function(){
 		yield _updateCustomTables();
 		yield Zotero.ItemTypes.init();
 		yield Zotero.ItemFields.init();
+		yield Zotero.CreatorTypes.init();
 		yield Zotero.SearchConditions.init();
 		
 		// Update item type menus in every open window
-		var wm = Components.classes["@mozilla.org/appshell/window-mediator;1"]
-					.getService(Components.interfaces.nsIWindowMediator);
-		var enumerator = wm.getEnumerator("navigator:browser");
-		while (enumerator.hasMoreElements()) {
-			var win = enumerator.getNext();
-			win.ZoteroPane.buildItemTypeSubMenu();
-			win.document.getElementById('zotero-editpane-item-box').buildItemTypeMenu();
-		}
+		Zotero.Schema.schemaUpdatePromise.then(function () {
+			var wm = Services.wm;
+			var enumerator = wm.getEnumerator("navigator:browser");
+			while (enumerator.hasMoreElements()) {
+				let win = enumerator.getNext();
+				win.ZoteroPane.buildItemTypeSubMenu();
+				win.document.getElementById('zotero-editpane-item-box').buildItemTypeMenu();
+			}
+		});
 	});
 	
 	
-	var _updateCustomTables = Zotero.Promise.coroutine(function* (skipDelete, skipSystem) {
+	var _updateCustomTables = async function () {
 		Zotero.debug("Updating custom tables");
 		
 		Zotero.DB.requireTransaction();
 		
-		if (!skipDelete) {
-			yield Zotero.DB.queryAsync("DELETE FROM itemTypesCombined");
-			yield Zotero.DB.queryAsync("DELETE FROM fieldsCombined WHERE fieldID NOT IN (SELECT fieldID FROM itemData)");
-			yield Zotero.DB.queryAsync("DELETE FROM itemTypeFieldsCombined");
-			yield Zotero.DB.queryAsync("DELETE FROM baseFieldMappingsCombined");
-		}
+		await Zotero.DB.queryAsync("DELETE FROM itemTypesCombined");
+		await Zotero.DB.queryAsync("DELETE FROM fieldsCombined WHERE fieldID NOT IN (SELECT fieldID FROM itemData)");
+		await Zotero.DB.queryAsync("DELETE FROM itemTypeFieldsCombined");
+		await Zotero.DB.queryAsync("DELETE FROM baseFieldMappingsCombined");
 		
 		var offset = Zotero.ItemTypes.customIDOffset;
-		yield Zotero.DB.queryAsync(
+		await Zotero.DB.queryAsync(
 			"INSERT INTO itemTypesCombined "
-				+ (
-					skipSystem
-					? ""
-					: "SELECT itemTypeID, typeName, display, 0 AS custom FROM itemTypes UNION "
-				)
+				+ "SELECT itemTypeID, typeName, display, 0 AS custom FROM itemTypes UNION "
 				+ "SELECT customItemTypeID + " + offset + " AS itemTypeID, typeName, display, 1 AS custom FROM customItemTypes"
 		);
-		yield Zotero.DB.queryAsync(
+		await Zotero.DB.queryAsync(
 			"INSERT OR IGNORE INTO fieldsCombined "
-				+ (
-					skipSystem
-					? ""
-					: "SELECT fieldID, fieldName, NULL AS label, fieldFormatID, 0 AS custom FROM fields UNION "
-				)
+				+ "SELECT fieldID, fieldName, NULL AS label, fieldFormatID, 0 AS custom FROM fields UNION "
 				+ "SELECT customFieldID + " + offset + " AS fieldID, fieldName, label, NULL, 1 AS custom FROM customFields"
 		);
-		yield Zotero.DB.queryAsync(
+		await Zotero.DB.queryAsync(
 			"INSERT INTO itemTypeFieldsCombined "
-				+ (
-					skipSystem
-					? ""
-					: "SELECT itemTypeID, fieldID, hide, orderIndex FROM itemTypeFields UNION "
-				)
+				+ "SELECT itemTypeID, fieldID, hide, orderIndex FROM itemTypeFields UNION "
 				+ "SELECT customItemTypeID + " + offset + " AS itemTypeID, "
 					+ "COALESCE(fieldID, customFieldID + " + offset + ") AS fieldID, hide, orderIndex FROM customItemTypeFields"
 		);
-		yield Zotero.DB.queryAsync(
+		await Zotero.DB.queryAsync(
 			"INSERT INTO baseFieldMappingsCombined "
-				+ (
-					skipSystem
-					? ""
-					: "SELECT itemTypeID, baseFieldID, fieldID FROM baseFieldMappings UNION "
-				)
+				+ "SELECT itemTypeID, baseFieldID, fieldID FROM baseFieldMappings UNION "
 				+ "SELECT customItemTypeID + " + offset + " AS itemTypeID, baseFieldID, "
 					+ "customFieldID + " + offset + " AS fieldID FROM customBaseFieldMappings"
 		);
-	});
+	};
 	
 	
 	/**
@@ -462,20 +906,24 @@ Zotero.Schema = new function(){
 			}
 			installLocation = installLocation.path;
 			
+			let initOpts = { fromSchemaUpdate: true };
+			
 			// Update files
 			switch (mode) {
 			case 'styles':
-				yield Zotero.Styles.init();
+				yield Zotero.Styles.init(initOpts);
 				var updated = yield _updateBundledFilesAtLocation(installLocation, mode);
+				break;
 			
 			case 'translators':
-				yield Zotero.Translators.init();
+				yield Zotero.Translators.init(initOpts);
 				var updated = yield _updateBundledFilesAtLocation(installLocation, mode);
+				break;
 			
 			default:
-				yield Zotero.Translators.init();
+				yield Zotero.Translators.init(initOpts);
 				let up1 = yield _updateBundledFilesAtLocation(installLocation, 'translators', true);
-				yield Zotero.Styles.init();
+				yield Zotero.Styles.init(initOpts);
 				let up2 = yield _updateBundledFilesAtLocation(installLocation, 'styles');
 				var updated = up1 || up2;
 			}
@@ -484,14 +932,7 @@ Zotero.Schema = new function(){
 			_localUpdateInProgress = false;
 		}
 		
-		if (updated) {
-			if (Zotero.Prefs.get('automaticScraperUpdates')) {
-				yield Zotero.Schema.updateFromRepository(2);
-			}
-		}
-		else {
-			yield Zotero.Schema.updateFromRepository(false);
-		}
+		return updated;
 	});
 	
 	/**
@@ -509,17 +950,6 @@ Zotero.Schema = new function(){
 			var xpiZipReader = Components.classes["@mozilla.org/libjar/zip-reader;1"]
 					.createInstance(Components.interfaces.nsIZipReader);
 			xpiZipReader.open(new FileUtils.File(installLocation));
-			
-			if(Zotero.isStandalone && !xpiZipReader.hasEntry("translators.index")) {
-				// Symlinked dev Standalone build
-				let parentDir = OS.Path.dirname(installLocation);
-				let translatorsDir = OS.Path.join(parentDir, 'translators');
-				if (yield OS.File.exists(translatorsDir)) {
-					installLocation = parentDir;
-					isUnpacked = true;
-					xpiZipReader.close();
-				}
-			}
 		}
 		
 		switch (mode) {
@@ -544,7 +974,7 @@ Zotero.Schema = new function(){
 		var ModeType = Zotero.Utilities.capitalize(modeType);
 		var Mode = Zotero.Utilities.capitalize(mode);
 		
-		var repotime = yield Zotero.File.getContentsFromURLAsync("resource://zotero/schema/repotime.txt");
+		var repotime = yield Zotero.File.getResourceAsync("resource://zotero/schema/repotime.txt");
 		var date = Zotero.Date.sqlToDate(repotime.trim(), true);
 		repotime = Zotero.Date.toUnixTimestamp(date);
 		
@@ -592,11 +1022,14 @@ Zotero.Schema = new function(){
 			var deleted = xpiZipReader.getInputStream("deleted.txt");
 		}
 		
-		deleted = yield Zotero.File.getContentsAsync(deleted);
-		deleted = deleted.match(/^([^\s]+)/gm);
-		var version = deleted.shift();
+		let deletedVersion;
+		if (deleted) {
+			deleted = yield Zotero.File.getContentsAsync(deleted);
+			deleted = deleted.match(/^([^\s]+)/gm);
+			deletedVersion = deleted.shift();
+		}
 		
-		if (!lastVersion || lastVersion < version) {
+		if (!lastVersion || lastVersion < deletedVersion) {
 			var toDelete = [];
 			let iterator = new OS.File.DirectoryIterator(destDir);
 			try {
@@ -641,8 +1074,8 @@ Zotero.Schema = new function(){
 						
 						if (mode == 'translators') {
 							// TODO: Change if the APIs change
-							let newObj = new Zotero[Mode].loadFromFile(entry.path);
-							if (deleted.indexOf(newObj[modeType + "ID"]) == -1) {
+							let newObj = yield Zotero[Mode].loadFromFile(entry.path);
+							if (!deleted.includes(newObj[modeType + "ID"])) {
 								continue;
 							}
 							toDelete.push(entry.path);
@@ -668,7 +1101,7 @@ Zotero.Schema = new function(){
 			
 			if (!skipVersionUpdates) {
 				let sql = "REPLACE INTO version (schema, version) VALUES ('delete', ?)";
-				yield Zotero.DB.queryAsync(sql, version);
+				yield Zotero.DB.queryAsync(sql, deletedVersion);
 			}
 		}
 		
@@ -677,6 +1110,10 @@ Zotero.Schema = new function(){
 		//
 		var sql = "SELECT version FROM version WHERE schema=?";
 		var lastModTime = yield Zotero.DB.valueQueryAsync(sql, mode);
+		// Fix millisecond times (possible in 4.0?)
+		if (lastModTime > 9999999999) {
+			lastModTime = Math.round(lastModTime / 1000);
+		}
 		var cache = {};
 		
 		// XPI installation
@@ -707,16 +1144,27 @@ Zotero.Schema = new function(){
 					index[id].extract = true;
 				}
 				
-				let sql = "SELECT metadataJSON FROM translatorCache";
-				let dbCache = yield Zotero.DB.columnQueryAsync(sql);
+				let sql = "SELECT rowid, fileName, metadataJSON FROM translatorCache";
+				let rows = yield Zotero.DB.queryAsync(sql);
 				// If there's anything in the cache, see what we actually need to extract
-				if (dbCache) {
-					for (let i = 0; i < dbCache.length; i++) {
-						let metadata = JSON.parse(dbCache[i]);
+				for (let i = 0; i < rows.length; i++) {
+					let json = rows[i].metadataJSON;
+					try {
+						let metadata = JSON.parse(json);
 						let id = metadata.translatorID;
-						if (index[id] && index[id].lastUpdated == metadata.lastUpdated) {
+						if (index[id] && index[id].lastUpdated <= metadata.lastUpdated) {
 							index[id].extract = false;
 						}
+					}
+					catch (e) {
+						Zotero.logError(e);
+						Zotero.debug(json, 1);
+						
+						// If JSON is invalid, clear from cache
+						yield Zotero.DB.queryAsync(
+							"DELETE FROM translatorCache WHERE rowid=?",
+							rows[i].rowid
+						);
 					}
 				}
 				
@@ -751,9 +1199,8 @@ Zotero.Schema = new function(){
 					catch (e) {
 						if (e instanceof OS.File.Error && e.becauseExists) {
 							// Could overwrite automatically, but we want to log this
-							let msg = "Overwriting translator with same filename '" + fileName + "'";
-							Zotero.debug(msg, 1);
-							Components.utils.reportError(msg);
+							Zotero.warn("Overwriting translator with same filename '"
+								+ entry.fileName + "'");
 							yield OS.File.move(tmpFile, destFile);
 						}
 						else {
@@ -915,10 +1362,8 @@ Zotero.Schema = new function(){
 							catch (e) {
 								if (e instanceof OS.File.Error && e.becauseExists) {
 									// Could overwrite automatically, but we want to log this
-									let msg = "Overwriting " + modeType + " with same filename "
-										+ "'" + fileName + "'";
-									Zotero.debug(msg, 1);
-									Components.utils.reportError(msg);
+									Zotero.warn("Overwriting " + modeType + " with same filename "
+										+ "'" + fileName + "'", 1);
 									yield OS.File.copy(entry.path, destFile);
 								}
 								else {
@@ -952,26 +1397,59 @@ Zotero.Schema = new function(){
 		});
 		
 		yield Zotero[Mode].reinit({
-			metadataCache: cache
+			metadataCache: cache,
+			fromSchemaUpdate: true
 		});
 		
 		return true;
 	});
 	
 	
+	this.onUpdateNotification = async function (delay) {
+		if (!Zotero.Prefs.get('automaticScraperUpdates')) {
+			return;
+		}
+		
+		// If another repository check -- either from notification or daily check -- is scheduled
+		// before delay, just wait for that one
+		if (_nextRepositoryUpdate) {
+			if (_nextRepositoryUpdate <= (Date.now() + delay)) {
+				Zotero.debug("Next scheduled update from repository is in "
+					+ Math.round((_nextRepositoryUpdate - Date.now()) / 1000) + " seconds "
+					+ "-- ignoring notification");
+				return;
+			}
+			if (_repositoryNotificationTimerID) {
+				clearTimeout(_repositoryNotificationTimerID);
+			}
+		}
+		
+		_nextRepositoryUpdate = Date.now() + delay;
+		Zotero.debug(`Updating from repository in ${Math.round(delay / 1000)} seconds`);
+		_repositoryNotificationTimerID = setTimeout(() => {
+			this.updateFromRepository(this.REPO_UPDATE_NOTIFICATION)
+		}, delay);
+	};
+	
+	
 	/**
 	 * Send XMLHTTP request for updated translators and styles to the central repository
 	 *
-	 * @param	{Boolean}	force	Force a repository query regardless of how
-	 *									long it's been since the last check
+	 * @param {Integer} [mode=0] - If non-zero, force a repository query regardless of how long it's
+	 *     been since the last check. Should be a REPO_UPDATE_* constant.
 	 */
-	this.updateFromRepository = Zotero.Promise.coroutine(function* (force) {
-		if (!force) {
-			if (_remoteUpdateInProgress) {
-				Zotero.debug("A remote update is already in progress -- not checking repository");
-				return false;
-			}
-			
+	this.updateFromRepository = Zotero.Promise.coroutine(function* (mode = 0) {
+		if (Zotero.skipBundledFiles) {
+			Zotero.debug("No bundled files -- skipping repository update");
+			return;
+		}
+		
+		if (_remoteUpdateInProgress) {
+			Zotero.debug("A remote update is already in progress -- not checking repository");
+			return false;
+		}
+		
+		if (mode == this.REPO_UPDATE_PERIODIC) {
 			// Check user preference for automatic updates
 			if (!Zotero.Prefs.get('automaticScraperUpdates')) {
 				Zotero.debug('Automatic repository updating disabled -- not checking repository', 4);
@@ -981,7 +1459,7 @@ Zotero.Schema = new function(){
 			// Determine the earliest local time that we'd query the repository again
 			let lastCheck = yield this.getDBVersion('lastcheck');
 			let nextCheck = new Date();
-			nextCheck.setTime((lastCheck + ZOTERO_CONFIG.REPOSITORY_CHECK_INTERVAL) * 1000);
+			nextCheck.setTime((lastCheck + REPOSITORY_CHECK_INTERVAL) * 1000);
 			
 			// If enough time hasn't passed, don't update
 			var now = new Date();
@@ -996,49 +1474,96 @@ Zotero.Schema = new function(){
 		if (_localUpdateInProgress) {
 			Zotero.debug('A local update is already in progress -- delaying repository check', 4);
 			_setRepositoryTimer(600);
-			return;
+			return false;
 		}
 		
 		if (Zotero.locked) {
 			Zotero.debug('Zotero is locked -- delaying repository check', 4);
 			_setRepositoryTimer(600);
-			return;
+			return false;
 		}
 		
-		// If transaction already in progress, delay by ten minutes
-		yield Zotero.DB.waitForTransaction();
+		// If an update from a notification is queued, stop it, since we're updating now
+		if (_repositoryNotificationTimerID) {
+			clearTimeout(_repositoryNotificationTimerID);
+			_repositoryNotificationTimerID = null;
+			_nextRepositoryUpdate = null;
+		}
+		
+		if (Zotero.DB.inTransaction()) {
+			yield Zotero.DB.waitForTransaction();
+		}
+		
+		try {
+			yield Zotero.Retractions.updateFromServer();
+		}
+		catch (e) {
+			Zotero.logError(e);
+		}
 		
 		// Get the last timestamp we got from the server
 		var lastUpdated = yield this.getDBVersion('repository');
+		var updated = false;
 		
 		try {
 			var url = ZOTERO_CONFIG.REPOSITORY_URL + 'updated?'
 				+ (lastUpdated ? 'last=' + lastUpdated + '&' : '')
 				+ 'version=' + Zotero.version;
 			
-			Zotero.debug('Checking repository for updates');
+			Zotero.debug('Checking repository for translator and style updates');
 			
 			_remoteUpdateInProgress = true;
 			
-			if (force) {
-				if (force == 2) {
-					url += '&m=2';
+			if (mode) {
+				url += '&m=' + mode;
+			}
+			
+			// TEMP: DB diagnostics
+			if (Zotero.isDevBuild) {
+				let badDB = false;
+				let exists = yield Zotero.DB.tableExists('transactionSets');
+				url += "&ts=" + (exists ? "1" : "0");
+				if (exists) {
+					Zotero.logError("DB table 'transactionSets' still exists");
+					badDB = true;
 				}
-				else {
-					url += '&m=1';
+				exists = yield Zotero.DB.tableExists('dbDebug1');
+				url += "&db1=" + (exists ? "1" : "0");
+				if (!exists) {
+					Zotero.logError("DB table 'dbDebug1' does not exist");
+					badDB = true;
+				}
+				if (badDB) {
+					let cloudDir = Zotero.File.isCloudStorageFolder(Zotero.DataDirectory.dir);
+					url += "&cd=" + (cloudDir ? "1" : "0");
+					
+					if (!this._debugDBIntegrityChecked) {
+						try {
+							let dbPath = Zotero.DataDirectory.getDatabase();
+							let dbInfo = yield OS.File.stat(dbPath);
+							if (dbInfo.size < 500000000) {
+								let ok = yield Zotero.DB.quickCheck();
+								url += "&qc=" + (ok ? "1" : "0");
+								this._debugDBIntegrityChecked = true;
+							}
+						}
+						catch (e) {
+							Zotero.logError(e);
+						}
+					}
 				}
 			}
 			
 			// Send list of installed styles
 			var styles = Zotero.Styles.getAll();
 			var styleTimestamps = [];
-			for (var id in styles) {
-				var updated = Zotero.Date.sqlToDate(styles[id].updated);
-				updated = updated ? updated.getTime() / 1000 : 0;
+			for (let id in styles) {
+				let styleUpdated = Zotero.Date.sqlToDate(styles[id].updated, true);
+				styleUpdated = styleUpdated ? styleUpdated.getTime() / 1000 : 0;
 				var selfLink = styles[id].url;
 				var data = {
 					id: id,
-					updated: updated
+					updated: styleUpdated
 				};
 				if (selfLink) {
 					data.url = selfLink;
@@ -1048,25 +1573,35 @@ Zotero.Schema = new function(){
 			var body = 'styles=' + encodeURIComponent(JSON.stringify(styleTimestamps));
 			
 			try {
-				var xmlhttp = yield Zotero.HTTP.request("POST", url, { body: body });
-				return _updateFromRepositoryCallback(xmlhttp, !!force);
+				var xmlhttp = yield Zotero.HTTP.request(
+					"POST",
+					url,
+					{
+						body,
+						errorDelayMax: 5000,
+						errorDelayIntervals: [5000]
+					}
+				);
+				updated = yield _handleRepositoryResponse(xmlhttp, mode);
 			}
 			catch (e) {
-				if (e instanceof Zotero.HTTP.UnexpectedStatusException
-						|| e instanceof Zotero.HTTP.BrowserOfflineException) {
-					let msg = " -- retrying in " + ZOTERO_CONFIG.REPOSITORY_RETRY_INTERVAL
-					if (e instanceof Zotero.HTTP.BrowserOfflineException) {
-						Zotero.debug("Browser is offline" + msg, 2);
+				if (mode == this.REPO_UPDATE_PERIODIC) {
+					if (e instanceof Zotero.HTTP.UnexpectedStatusException
+							|| e instanceof Zotero.HTTP.BrowserOfflineException) {
+						let msg = " -- retrying in " + REPOSITORY_RETRY_INTERVAL
+						if (e instanceof Zotero.HTTP.BrowserOfflineException) {
+							Zotero.debug("Browser is offline" + msg, 2);
+						}
+						else {
+							Zotero.logError(e);
+							Zotero.debug(e.status, 1);
+							Zotero.debug(e.xmlhttp.responseText, 1);
+							Zotero.debug("Error updating from repository " + msg, 1);
+						}
+						// TODO: instead, add an observer to start and stop timer on online state change
+						_setRepositoryTimer(REPOSITORY_RETRY_INTERVAL);
+						return;
 					}
-					else {
-						Zotero.logError(e);
-						Zotero.debug(e.status, 1);
-						Zotero.debug(e.xmlhttp.responseText, 1);
-						Zotero.debug("Error updating from repository " + msg, 1);
-					}
-					// TODO: instead, add an observer to start and stop timer on online state change
-					_setRepositoryTimer(ZOTERO_CONFIG.REPOSITORY_RETRY_INTERVAL);
-					return;
 				}
 				if (xmlhttp) {
 					Zotero.debug(xmlhttp.status, 1);
@@ -1076,16 +1611,28 @@ Zotero.Schema = new function(){
 			};
 		}
 		finally {
+			if (mode == this.REPO_UPDATE_PERIODIC) {
+				_setRepositoryTimer(REPOSITORY_RETRY_INTERVAL);
+			}
 			_remoteUpdateInProgress = false;
 		}
+		
+		return updated;
 	});
 	
 	
 	this.stopRepositoryTimer = function () {
-		if (_repositoryTimer){
+		if (_repositoryTimerID) {
 			Zotero.debug('Stopping repository check timer');
-			_repositoryTimer.cancel();
+			clearTimeout(_repositoryTimerID);
+			_repositoryTimerID = null;
 		}
+		if (_repositoryNotificationTimerID) {
+			Zotero.debug('Stopping repository notification update timer');
+			clearTimeout(_repositoryNotificationTimerID);
+			_repositoryNotificationTimerID = null
+		}
+		_nextRepositoryUpdate = null;
 	}
 	
 	
@@ -1095,6 +1642,10 @@ Zotero.Schema = new function(){
 		var sql = "DELETE FROM version WHERE schema IN "
 			+ "('translators', 'styles', 'repository', 'lastcheck')";
 		yield Zotero.DB.queryAsync(sql);
+		
+		sql = "DELETE FROM translatorCache";
+		yield Zotero.DB.queryAsync(sql);
+		
 		_dbVersions.repository = null;
 		_dbVersions.lastcheck = null;
 		
@@ -1109,7 +1660,11 @@ Zotero.Schema = new function(){
 		Zotero.getStylesDirectory();
 		
 		yield Zotero.Promise.all(Zotero.Translators.reinit(), Zotero.Styles.reinit());
-		yield this.updateBundledFiles();
+		var updated = yield this.updateBundledFiles();
+		if (updated && Zotero.Prefs.get('automaticScraperUpdates')) {
+			yield Zotero.Schema.updateFromRepository(this.REPO_UPDATE_MANUAL);
+		}
+		return updated;
 	});
 	
 	
@@ -1119,6 +1674,10 @@ Zotero.Schema = new function(){
 		var sql = "DELETE FROM version WHERE schema IN "
 			+ "('translators', 'repository', 'lastcheck')";
 		yield Zotero.DB.queryAsync(sql);
+		
+		sql = "DELETE FROM translatorCache";
+		yield Zotero.DB.queryAsync(sql);
+		
 		_dbVersions.repository = null;
 		_dbVersions.lastcheck = null;
 		
@@ -1126,12 +1685,16 @@ Zotero.Schema = new function(){
 		translatorsDir.remove(true);
 		Zotero.getTranslatorsDirectory(); // recreate directory
 		yield Zotero.Translators.reinit();
-		return this.updateBundledFiles('translators');
+		var updated = yield this.updateBundledFiles('translators');
+		if (updated && Zotero.Prefs.get('automaticScraperUpdates')) {
+			yield Zotero.Schema.updateFromRepository(this.REPO_UPDATE_MANUAL);
+		}
+		return updated;
 	});
 	
 	
 	this.resetStyles = Zotero.Promise.coroutine(function* () {
-		Zotero.debug("Resetting translators and styles");
+		Zotero.debug("Resetting styles");
 		
 		var sql = "DELETE FROM version WHERE schema IN "
 			+ "('styles', 'repository', 'lastcheck')";
@@ -1143,12 +1706,35 @@ Zotero.Schema = new function(){
 		stylesDir.remove(true);
 		Zotero.getStylesDirectory(); // recreate directory
 		yield Zotero.Styles.reinit()
-		return this.updateBundledFiles('styles');
+		var updated = yield this.updateBundledFiles('styles');
+		if (updated && Zotero.Prefs.get('automaticScraperUpdates')) {
+			yield Zotero.Schema.updateFromRepository(this.REPO_UPDATE_MANUAL);
+		}
+		return updated;
 	});
 	
 	
+	this.integrityCheckRequired = async function () {
+		return !!await Zotero.DB.valueQueryAsync(
+			"SELECT value FROM settings WHERE setting='db' AND key='integrityCheck'"
+		);
+	};
+	
+	
+	this.setIntegrityCheckRequired = async function (required) {
+		var sql;
+		if (required) {
+			sql = "REPLACE INTO settings VALUES ('db', 'integrityCheck', 1)";
+		}
+		else {
+			sql = "DELETE FROM settings WHERE setting='db' AND key='integrityCheck'";
+		}
+		await Zotero.DB.queryAsync(sql);
+	};
+	
+	
 	this.integrityCheck = Zotero.Promise.coroutine(function* (fix) {
-		var userLibraryID = Zotero.Libraries.userLibraryID;
+		Zotero.debug("Checking database integrity");
 		
 		// Just as a sanity check, make sure combined field tables are populated,
 		// so that we don't try to wipe out all data
@@ -1175,62 +1761,182 @@ Zotero.Schema = new function(){
 			}
 		}
 		
+		var attachmentID = parseInt(yield Zotero.DB.valueQueryAsync(
+			"SELECT itemTypeID FROM itemTypes WHERE typeName='attachment'"
+		));
+		var noteID = parseInt(yield Zotero.DB.valueQueryAsync(
+			"SELECT itemTypeID FROM itemTypes WHERE typeName='note'"
+		));
 		
-		// For non-foreign key checks, there should be an equivalent entry for every statement
-		// run by the DB Repair Tool. Repair entry (second position) can be either a string or
-		// an array with multiple statements.
-		var queries = [
+		
+		// Non-foreign key checks
+		//
+		// The first position is for testing and the second is for repairing. Can be either SQL
+		// statements or promise-returning functions. For statements, the repair entry can be either a
+		// string or an array with multiple statements. Functions should avoid assuming any global state
+		// (e.g., loaded data).
+		var checks = [
 			// Can't be a FK with itemTypesCombined
 			[
-				"SELECT COUNT(*) FROM items WHERE itemTypeID IS NULL",
+				"SELECT COUNT(*) > 0 FROM items WHERE itemTypeID IS NULL",
 				"DELETE FROM items WHERE itemTypeID IS NULL",
 			],
-			// Attachments row with itemTypeID != 14
+			// Non-attachment items in attachments table
 			[
-				"SELECT COUNT(*) FROM itemAttachments JOIN items USING (itemID) WHERE itemTypeID != 14",
-				"UPDATE items SET itemTypeID=14, clientDateModified=CURRENT_TIMESTAMP WHERE itemTypeID != 14 AND itemID IN (SELECT itemID FROM itemAttachments)",
+				`SELECT COUNT(*) > 0 FROM itemAttachments JOIN items USING (itemID) WHERE itemTypeID != ${attachmentID}`,
+				`UPDATE items SET itemTypeID=${attachmentID}, clientDateModified=CURRENT_TIMESTAMP WHERE itemTypeID != ${attachmentID} AND itemID IN (SELECT itemID FROM itemAttachments)`,
 			],
 			// Fields not in type
 			[
-				"SELECT COUNT(*) FROM itemData WHERE fieldID NOT IN (SELECT fieldID FROM itemTypeFieldsCombined WHERE itemTypeID=(SELECT itemTypeID FROM items WHERE itemID=itemData.itemID))",
+				"SELECT COUNT(*) > 0 FROM itemData WHERE fieldID NOT IN (SELECT fieldID FROM itemTypeFieldsCombined WHERE itemTypeID=(SELECT itemTypeID FROM items WHERE itemID=itemData.itemID))",
 				"DELETE FROM itemData WHERE fieldID NOT IN (SELECT fieldID FROM itemTypeFieldsCombined WHERE itemTypeID=(SELECT itemTypeID FROM items WHERE itemID=itemData.itemID))",
 			],
-			// Missing itemAttachments row
+			// Missing itemAttachments rows
 			[
-				"SELECT COUNT(*) FROM items WHERE itemTypeID=14 AND itemID NOT IN (SELECT itemID FROM itemAttachments)",
-				"INSERT INTO itemAttachments (itemID, linkMode) SELECT itemID, 0 FROM items WHERE itemTypeID=14 AND itemID NOT IN (SELECT itemID FROM itemAttachments)",
+				`SELECT COUNT(*) > 0 FROM items WHERE itemTypeID=${attachmentID} AND itemID NOT IN (SELECT itemID FROM itemAttachments)`,
+				`INSERT INTO itemAttachments (itemID, linkMode) SELECT itemID, 0 FROM items WHERE itemTypeID=${attachmentID} AND itemID NOT IN (SELECT itemID FROM itemAttachments)`,
 			],
 			// Note/child parents
 			[
-				"SELECT COUNT(*) FROM itemAttachments WHERE parentItemID IN (SELECT itemID FROM items WHERE itemTypeID IN (1,14))",
-				"UPDATE itemAttachments SET parentItemID=NULL WHERE parentItemID IN (SELECT itemID FROM items WHERE itemTypeID IN (1,14))",
+				`SELECT COUNT(*) > 0 FROM itemAttachments WHERE parentItemID IN (SELECT itemID FROM items WHERE itemTypeID IN (${noteID}, ${attachmentID}))`,
+				`UPDATE itemAttachments SET parentItemID=NULL WHERE parentItemID IN (SELECT itemID FROM items WHERE itemTypeID IN (${noteID}, ${attachmentID}))`,
 			],
 			[
-				"SELECT COUNT(*) FROM itemNotes WHERE parentItemID IN (SELECT itemID FROM items WHERE itemTypeID IN (1,14))",
-				"UPDATE itemNotes SET parentItemID=NULL WHERE parentItemID IN (SELECT itemID FROM items WHERE itemTypeID IN (1,14))",
+				`SELECT COUNT(*) > 0 FROM itemNotes WHERE parentItemID IN (SELECT itemID FROM items WHERE itemTypeID IN (${noteID}, ${attachmentID}))`,
+				`UPDATE itemNotes SET parentItemID=NULL WHERE parentItemID IN (SELECT itemID FROM items WHERE itemTypeID IN (${noteID}, ${attachmentID}))`,
 			],
 			
 			// Delete empty creators
 			// This may cause itemCreator gaps, but that's better than empty creators
 			[
-				"SELECT COUNT(*) FROM creators WHERE firstName='' AND lastName=''",
+				"SELECT COUNT(*) > 0 FROM creators WHERE firstName='' AND lastName=''",
 				"DELETE FROM creators WHERE firstName='' AND lastName=''"
 			],
 			
 			// Non-attachment items in the full-text index
 			[
-				"SELECT COUNT(*) FROM fulltextItemWords WHERE itemID NOT IN (SELECT itemID FROM items WHERE itemTypeID=14)",
-				"DELETE FROM fulltextItemWords WHERE itemID NOT IN (SELECT itemID FROM items WHERE itemTypeID=14)"
+				`SELECT COUNT(*) > 0 FROM fulltextItemWords WHERE itemID NOT IN (SELECT itemID FROM items WHERE itemTypeID=${attachmentID})`,
+				`DELETE FROM fulltextItemWords WHERE itemID NOT IN (SELECT itemID FROM items WHERE itemTypeID=${attachmentID})`
 			],
 			// Full-text items must be attachments
 			[
-				"SELECT COUNT(*) FROM fulltextItems WHERE itemID NOT IN (SELECT itemID FROM items WHERE itemTypeID=14)",
-				"DELETE FROM fulltextItems WHERE itemID NOT IN (SELECT itemID FROM items WHERE itemTypeID=14)"
+				`SELECT COUNT(*) > 0 FROM fulltextItems WHERE itemID NOT IN (SELECT itemID FROM items WHERE itemTypeID=${attachmentID})`,
+				`DELETE FROM fulltextItems WHERE itemID NOT IN (SELECT itemID FROM items WHERE itemTypeID=${attachmentID})`
+			],
+			// Invalid link mode -- set to imported url
+			[
+				"SELECT COUNT(*) > 0 FROM itemAttachments WHERE linkMode NOT IN (0,1,2,3)",
+				"UPDATE itemAttachments SET linkMode=1 WHERE linkMode NOT IN (0,1,2,3)"
+			],
+			// Creators with first name can't be fieldMode 1
+			[
+				"SELECT COUNT(*) > 0 FROM creators WHERE fieldMode = 1 AND firstName != ''",
+				function () {
+					return Zotero.DB.executeTransaction(function* () {
+						var rows = yield Zotero.DB.queryAsync("SELECT * FROM creators WHERE fieldMode = 1 AND firstName != ''");
+						for (let row of rows) {
+							// Find existing fieldMode 0 row and use that if available
+							let newID = yield Zotero.DB.valueQueryAsync("SELECT creatorID FROM creators WHERE firstName=? AND lastName=? AND fieldMode=0", [row.firstName, row.lastName]);
+							if (newID) {
+								yield Zotero.DB.queryAsync("UPDATE itemCreators SET creatorID=? WHERE creatorID=?", [newID, row.creatorID]);
+								yield Zotero.DB.queryAsync("DELETE FROM creators WHERE creatorID=?", row.creatorID);
+							}
+							// Otherwise convert this one to fieldMode 0
+							else {
+								yield Zotero.DB.queryAsync("UPDATE creators SET fieldMode=0 WHERE creatorID=?", row.creatorID);
+							}
+						}
+					});
+				}
+			],
+			// TEXT userID
+			[
+				"SELECT COUNT(*) > 0 FROM settings WHERE setting='account' AND key='userID' AND TYPEOF(value)='text'",
+				async function () {
+					let userID = await Zotero.DB.valueQueryAsync("SELECT value FROM settings WHERE setting='account' AND key='userID'");
+					await Zotero.DB.queryAsync("UPDATE settings SET value=? WHERE setting='account' AND key='userID'", parseInt(userID.trim()));
+				}
+			],
+			// Invalid collections nesting
+			[
+				async function () {
+					let rows = await Zotero.DB.queryAsync(
+						"SELECT collectionID, parentCollectionID FROM collections"
+					);
+					let map = new Map();
+					let ids = [];
+					for (let row of rows) {
+						map.set(row.collectionID, row.parentCollectionID);
+						ids.push(row.collectionID);
+					}
+					for (let id of ids) {
+						// Keep track of collections we've seen
+						let seen = new Set([id]);
+						while (true) {
+							let parent = map.get(id);
+							if (!parent) {
+								break;
+							}
+							if (seen.has(parent)) {
+								Zotero.debug(`Collection ${id} parent ${parent} was already seen`, 2);
+								return true;
+							}
+							seen.add(parent);
+							id = parent;
+						}
+					}
+					return false;
+				},
+				async function () {
+					let fix = async function () {
+						let rows = await Zotero.DB.queryAsync(
+							"SELECT collectionID, parentCollectionID FROM collections"
+						);
+						let map = new Map();
+						let ids = [];
+						for (let row of rows) {
+							map.set(row.collectionID, row.parentCollectionID);
+							ids.push(row.collectionID);
+						}
+						for (let id of ids) {
+							let seen = new Set([id]);
+							while (true) {
+								let parent = map.get(id);
+								if (!parent) {
+									break;
+								}
+								if (seen.has(parent)) {
+									await Zotero.DB.queryAsync(
+										"UPDATE collections SET parentCollectionID = NULL "
+											+ "WHERE collectionID = ?",
+										id
+									);
+									// Restart
+									return true;
+								}
+								seen.add(parent);
+								id = parent;
+							}
+						}
+						// Done
+						return false;
+					};
+					
+					while (await fix()) {}
+				}
 			]
 		];
 		
-		for (let sql of queries) {
-			let errorsFound = yield Zotero.DB.valueQueryAsync(sql[0]);
+		for (let check of checks) {
+			let errorsFound = false;
+			// SQL statement
+			if (typeof check[0] == 'string') {
+				errorsFound = yield Zotero.DB.valueQueryAsync(check[0]);
+			}
+			// Function
+			else {
+				errorsFound = yield check[0]();
+			}
 			if (!errorsFound) {
 				continue;
 			}
@@ -1240,23 +1946,35 @@ Zotero.Schema = new function(){
 			if (fix) {
 				try {
 					// Single query
-					if (typeof sql[1] == 'string') {
-						yield Zotero.DB.queryAsync(sql[1]);
+					if (typeof check[1] == 'string') {
+						yield Zotero.DB.queryAsync(check[1]);
 					}
 					// Multiple queries
-					else {
-						for (let s of sql[1]) {
+					else if (Array.isArray(check[1])) {
+						for (let s of check[1]) {
 							yield Zotero.DB.queryAsync(s);
 						}
+					}
+					// Function
+					else {
+						yield check[1]();
 					}
 					continue;
 				}
 				catch (e) {
 					Zotero.logError(e);
+					// Clear flag on failure, to avoid showing an error on every startup if someone
+					// doesn't know how to deal with it
+					yield this.setIntegrityCheckRequired(false);
 				}
 			}
 			
 			return false;
+		}
+		
+		// Clear flag on success
+		if (fix) {
+			yield this.setIntegrityCheckRequired(false);
 		}
 		
 		return true;
@@ -1295,7 +2013,7 @@ Zotero.Schema = new function(){
 			throw ('Schema type not provided to _getSchemaSQL()');
 		}
 		
-		return Zotero.File.getContentsFromURLAsync("resource://zotero/schema/" + schema + ".sql");
+		return Zotero.File.getResourceAsync(`resource://zotero/schema/${schema}.sql`);
 	}
 	
 	
@@ -1323,8 +2041,8 @@ Zotero.Schema = new function(){
 	/*
 	 * Create new DB schema
 	 */
-	function _initializeSchema(){
-		return Zotero.DB.executeTransaction(function* (conn) {
+	async function _initializeSchema() {
+		await Zotero.DB.executeTransaction(function* (conn) {
 			var userLibraryID = 1;
 			
 			// Enable auto-vacuuming
@@ -1341,7 +2059,9 @@ Zotero.Schema = new function(){
 			yield _getSchemaSQL('triggers').then(function (sql) {
 				return Zotero.DB.executeSQLFile(sql);
 			});
-			yield _updateCustomTables(true);
+			
+			var schema = yield _readGlobalSchemaFromFile();
+			yield _updateGlobalSchema(schema);
 			
 			yield _getSchemaSQLVersion('system').then(function (version) {
 				return _updateDBVersion('system', version);
@@ -1356,39 +2076,8 @@ Zotero.Schema = new function(){
 			
 			var sql = "INSERT INTO libraries (libraryID, type, editable, filesEditable) "
 				+ "VALUES "
-				+ "(?, 'user', 1, 1), "
-				+ "(4, 'publications', 1, 1)"
+				+ "(?, 'user', 1, 1)";
 			yield Zotero.DB.queryAsync(sql, userLibraryID);
-			
-			/*if (!Zotero.Schema.skipDefaultData) {
-				// Quick Start Guide web page item
-				var sql = "INSERT INTO items VALUES(1, 13, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, 'ABCD2345', 0, 0)";
-				yield Zotero.DB.queryAsync(sql, userLibraryID);
-				var sql = "INSERT INTO itemDataValues VALUES (1, ?)";
-				yield Zotero.DB.queryAsync(sql, Zotero.getString('install.quickStartGuide'));
-				var sql = "INSERT INTO itemData VALUES (1, 110, 1)";
-				yield Zotero.DB.queryAsync(sql);
-				var sql = "INSERT INTO itemDataValues VALUES (2, 'https://www.zotero.org/support/quick_start_guide')";
-				yield Zotero.DB.queryAsync(sql);
-				var sql = "INSERT INTO itemData VALUES (1, 1, 2)";
-				yield Zotero.DB.queryAsync(sql);
-				
-				// CHNM as creator
-				var sql = "INSERT INTO creators VALUES (1, '', 'Center for History and New Media', 1)";
-				yield Zotero.DB.queryAsync(sql);
-				var sql = "INSERT INTO itemCreators VALUES (1, 1, 1, 0)";
-				yield Zotero.DB.queryAsync(sql);
-				
-				// Welcome note
-				var sql = "INSERT INTO items VALUES(2, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?, 'ABCD3456', 0, 0)";
-				yield Zotero.DB.queryAsync(sql, userLibraryID);
-				var welcomeTitle = Zotero.getString('install.quickStartGuide.message.welcome');
-				var welcomeMsg = '<div class="zotero-note znv1"><p><strong>' + welcomeTitle + '</strong></p>'
-					+ '<p>' + Zotero.getString('install.quickStartGuide.message.view') + '</p>'
-					+ '<p>' + Zotero.getString('install.quickStartGuide.message.thanks') + '</p></div>';
-				var sql = "INSERT INTO itemNotes VALUES (2, 1, ?, ?)";
-				yield Zotero.DB.queryAsync(sql, [welcomeMsg, welcomeTitle]);
-			}*/
 			
 			yield _updateLastClientVersion();
 			
@@ -1415,26 +2104,29 @@ Zotero.Schema = new function(){
 	}
 	
 	
-	function _updateSchema(schema){
-		return Zotero.Promise.all([Zotero.Schema.getDBVersion(schema), _getSchemaSQLVersion(schema)])
-		.spread(function (dbVersion, schemaVersion) {
-			if (dbVersion == schemaVersion) {
-				return false;
-			}
-			else if (dbVersion < schemaVersion) {
-				return _getSchemaSQL(schema)
-				.then(function (sql) {
-					return Zotero.DB.executeSQLFile(sql);
-				})
-				.then(function () {
-					return _updateDBVersion(schema, schemaVersion);
-				});
-			}
-			
-			throw new Error("Zotero '" + schema + "' DB version (" + dbVersion
-				+ ") is newer than SQL file (" + schemaVersion + ")");
-		});
-	}
+	/**
+	 * Requires a transaction
+	 */
+	var _updateSchema = Zotero.Promise.coroutine(function* (schema) {
+		var [dbVersion, schemaVersion] = yield Zotero.Promise.all(
+			[Zotero.Schema.getDBVersion(schema), _getSchemaSQLVersion(schema)]
+		);
+		if (dbVersion == schemaVersion) {
+			return false;
+		}
+		if (dbVersion > schemaVersion) {
+			let dbClientVersion = yield Zotero.DB.valueQueryAsync(
+				"SELECT value FROM settings WHERE setting='client' AND key='lastCompatibleVersion'"
+			);
+			throw new Zotero.DB.IncompatibleVersionException(
+				`Zotero '${schema}' DB version (${dbVersion}) is newer than SQL file (${schemaVersion})`,
+				dbClientVersion
+			);
+		}
+		let sql = yield _getSchemaSQL(schema);
+		yield Zotero.DB.executeSQLFile(sql);
+		return _updateDBVersion(schema, schemaVersion);
+	});
 	
 	
 	var _updateCompatibility = Zotero.Promise.coroutine(function* (version) {
@@ -1486,9 +2178,9 @@ Zotero.Schema = new function(){
 	/**
 	 * Process the response from the repository
 	 *
-	 * @return {Promise:Boolean} A promise for whether the update suceeded
+	 * @return {Promise:Boolean} A promise for whether the update succeeded
 	 **/
-	function _updateFromRepositoryCallback(xmlhttp, manual) {
+	async function _handleRepositoryResponse(xmlhttp, mode) {
 		if (!xmlhttp.responseXML){
 			try {
 				if (xmlhttp.status>1000){
@@ -1503,12 +2195,7 @@ Zotero.Schema = new function(){
 			catch (e){
 				Zotero.debug('Repository cannot be contacted');
 			}
-			
-			if (!manual){
-				_setRepositoryTimer(ZOTERO_CONFIG['REPOSITORY_RETRY_INTERVAL']);
-			}
-			
-			return Zotero.Promise.resolve(false);
+			return false;
 		}
 		
 		var currentTime = xmlhttp.responseXML.
@@ -1517,182 +2204,54 @@ Zotero.Schema = new function(){
 		var translatorUpdates = xmlhttp.responseXML.getElementsByTagName('translator');
 		var styleUpdates = xmlhttp.responseXML.getElementsByTagName('style');
 		
-		var updatePDFTools = function () {
-			// No updates for PPC
-			if (Zotero.platform == 'MacPPC') return;
-			
-			let pdfToolsUpdates = xmlhttp.responseXML.getElementsByTagName('pdftools');
-			if (pdfToolsUpdates.length) {
-				let availableVersion = pdfToolsUpdates[0].getAttribute('version');
-				let installInfo = false;
-				let installConverter = false;
-				
-				// Don't auto-install if not installed
-				if (!Zotero.Fulltext.pdfInfoIsRegistered() && !Zotero.Fulltext.pdfConverterIsRegistered()) {
-					return;
-				}
-				
-				// TEMP
-				if (Zotero.isWin) {
-					if (Zotero.Fulltext.pdfInfoIsRegistered()) {
-						if (Zotero.Fulltext.pdfInfoVersion != '3.02a') {
-							installInfo = true;
-						}
-					}
-					// Install missing component if one is installed
-					else if (Zotero.Fulltext.pdfConverterIsRegistered()) {
-						installInfo = true;
-					}
-					if (Zotero.Fulltext.pdfConverterIsRegistered()) {
-						if (Zotero.Fulltext.pdfConverterVersion != '3.02a') {
-							installConverter = true;
-						}
-					}
-					// Install missing component if one is installed
-					else if (Zotero.Fulltext.pdfInfoIsRegistered()) {
-						installConverter = true;
-					}
-					availableVersion = '3.02';
-				}
-				else {
-					if (Zotero.Fulltext.pdfInfoIsRegistered()) {
-						let currentVersion = Zotero.Fulltext.pdfInfoVersion;
-						if (currentVersion < availableVersion || currentVersion.startsWith('3.02')
-								|| currentVersion == 'UNKNOWN') {
-							installInfo = true;
-						}
-					}
-					// Install missing component if one is installed
-					else if (Zotero.Fulltext.pdfConverterIsRegistered()) {
-						installInfo = true;
-					}
-					if (Zotero.Fulltext.pdfConverterIsRegistered()) {
-						let currentVersion = Zotero.Fulltext.pdfConverterVersion;
-						if (currentVersion < availableVersion || currentVersion.startsWith('3.02')
-								|| currentVersion == 'UNKNOWN') {
-							installConverter = true;
-						}
-					}
-					// Install missing component if one is installed
-					else if (Zotero.Fulltext.pdfInfoIsRegistered()) {
-						installConverter = true;
-					}
-				}
-				
-				let prefKey = 'pdfToolsInstallError';
-				let lastTry = 0, delay = 43200000; // half a day, so doubles to a day initially
-				try {
-					[lastTry, delay] = Zotero.Prefs.get(prefKey).split(';');
-				}
-				catch (e) {}
-				
-				// Allow an additional minute, since repo updates might not be exact
-				if (Date.now() < (parseInt(lastTry) + parseInt(delay) - 60000)) {
-					Zotero.debug("Now enough time since last PDF tools installation failure -- skipping", 2);
-					return;
-				}
-				
-				var checkResult = function (success) {
-					if (success) {
-						try {
-							Zotero.Prefs.clear(prefKey);
-						}
-						catch (e) {}
-					}
-					else {
-						// Keep doubling delay, to a max of 1 week
-						Zotero.Prefs.set(prefKey, Date.now() + ";" + Math.min(delay * 2, 7*24*60*60*1000));
-						
-						let msg = "Error downloading PDF tool";
-						Zotero.debug(msg, 1);
-						throw new Error(msg);
-					}
-				};
-				
-				if (installConverter && installInfo) {
-					Zotero.Fulltext.downloadPDFTool('converter', availableVersion, function (success) {
-						checkResult(success);
-						Zotero.Fulltext.downloadPDFTool('info', availableVersion, checkResult);
-					});
-				}
-				else if (installConverter) {
-					Zotero.Fulltext.downloadPDFTool('converter', availableVersion, checkResult);
-				}
-				else if (installInfo) {
-					Zotero.Fulltext.downloadPDFTool('info', availableVersion, checkResult);
-				}
-				else {
-					Zotero.debug("PDF tools are up to date");
-				}
-			}
-		};
-		
 		if (!translatorUpdates.length && !styleUpdates.length){
-			return Zotero.DB.executeTransaction(function* (conn) {
+			await Zotero.DB.executeTransaction(function* (conn) {
 				// Store the timestamp provided by the server
 				yield _updateDBVersion('repository', currentTime);
 				
 				// And the local timestamp of the update time
 				yield _updateDBVersion('lastcheck', lastCheckTime);
-			})
-			.then(function () {
-				Zotero.debug('All translators and styles are up-to-date');
-				if (!manual) {
-					_setRepositoryTimer(ZOTERO_CONFIG['REPOSITORY_CHECK_INTERVAL']);
-				}
+			});
+			
+			Zotero.debug('All translators and styles are up-to-date');
+			if (mode == this.REPO_UPDATE_PERIODIC) {
+				_setRepositoryTimer(REPOSITORY_CHECK_INTERVAL);
+			}
+			return true;
+		}
+		
+		var updated = false;
+		try {
+			for (var i=0, len=translatorUpdates.length; i<len; i++){
+				await _translatorXMLToFile(translatorUpdates[i]);
+			}
+			
+			for (var i=0, len=styleUpdates.length; i<len; i++){
+				await _styleXMLToFile(styleUpdates[i]);
+			}
+			
+			// Rebuild caches
+			let fromSchemaUpdate = mode != this.REPO_UPDATE_MANUAL;
+			await Zotero.Translators.reinit({ fromSchemaUpdate });
+			await Zotero.Styles.reinit({ fromSchemaUpdate });
+			
+			updated = true;
+		}
+		catch (e) {
+			Zotero.logError(e);
+		}
+		
+		if (updated) {
+			await Zotero.DB.executeTransaction(function* (conn) {
+				// Store the timestamp provided by the server
+				yield _updateDBVersion('repository', currentTime);
 				
-				return Zotero.Promise.resolve(true);
-			})
-			.tap(function () {
-				updatePDFTools();
+				// And the local timestamp of the update time
+				yield _updateDBVersion('lastcheck', lastCheckTime);
 			});
 		}
 		
-		return Zotero.spawn(function* () {
-			try {
-				for (var i=0, len=translatorUpdates.length; i<len; i++){
-					yield _translatorXMLToFile(translatorUpdates[i]);
-				}
-				
-				for (var i=0, len=styleUpdates.length; i<len; i++){
-					yield _styleXMLToFile(styleUpdates[i]);
-				}
-				
-				// Rebuild caches
-				yield Zotero.Translators.reinit();
-				yield Zotero.Styles.reinit();
-			}
-			catch (e) {
-				Zotero.debug(e, 1);
-				if (!manual){
-					_setRepositoryTimer(ZOTERO_CONFIG['REPOSITORY_RETRY_INTERVAL']);
-				}
-				return false;
-			}
-			
-			return true;
-		})
-		.then(function (update) {
-			if (!update) return false;
-			
-			return Zotero.DB.executeTransaction(function* (conn) {
-				// Store the timestamp provided by the server
-				yield _updateDBVersion('repository', currentTime);
-				
-				// And the local timestamp of the update time
-				yield _updateDBVersion('lastcheck', lastCheckTime);
-			})
-			.then(function () {
-				if (!manual) {
-					_setRepositoryTimer(ZOTERO_CONFIG['REPOSITORY_CHECK_INTERVAL']);
-				}
-				
-				return true;
-			});
-		})
-		.tap(function () {
-			updatePDFTools();
-		});
+		return updated;
 	}
 	
 	
@@ -1701,26 +2260,23 @@ Zotero.Schema = new function(){
 	*
 	* We add an additional two seconds to avoid race conditions
 	**/
-	function _setRepositoryTimer(interval){
-		if (!interval){
-			interval = ZOTERO_CONFIG['REPOSITORY_CHECK_INTERVAL'];
-		}
-		
+	function _setRepositoryTimer(delay) {
 		var fudge = 2; // two seconds
-		var displayInterval = interval + fudge;
-		var interval = (interval + fudge) * 1000; // convert to ms
+		var displayInterval = delay + fudge;
+		delay = (delay + fudge) * 1000; // convert to ms
 		
-		if (!_repositoryTimer || _repositoryTimer.delay!=interval){
-			Zotero.debug('Setting repository check interval to ' + displayInterval + ' seconds');
-			_repositoryTimer = Components.classes["@mozilla.org/timer;1"].
-				createInstance(Components.interfaces.nsITimer);
-			_repositoryTimer.initWithCallback({
-				// implements nsITimerCallback
-				notify: function(timer){
-					Zotero.Schema.updateFromRepository();
-				}
-			}, interval, Components.interfaces.nsITimer.TYPE_REPEATING_SLACK);
+		if (_repositoryTimerID) {
+			clearTimeout(_repositoryTimerID);
+			_repositoryTimerID = null;
 		}
+		if (_repositoryNotificationTimerID) {
+			clearTimeout(_repositoryNotificationTimerID);
+			_repositoryNotificationTimerID = null;
+		}
+		
+		Zotero.debug('Scheduling next repository check in ' + displayInterval + ' seconds');
+		_repositoryTimerID = setTimeout(() => Zotero.Schema.updateFromRepository(), delay);
+		_nextRepositoryUpdate = Date.now() + delay;
 	}
 	
 	
@@ -1856,7 +2412,7 @@ Zotero.Schema = new function(){
 	//
 	// If libraryID set, make sure no relations still use a local user key, and then remove on-error code in sync.js
 	
-	var _migrateUserDataSchema = Zotero.Promise.coroutine(function* (fromVersion) {
+	var _migrateUserDataSchema = Zotero.Promise.coroutine(function* (fromVersion, options = {}) {
 		var toVersion = yield _getSchemaSQLVersion('userdata');
 		
 		if (fromVersion >= toVersion) {
@@ -1864,6 +2420,13 @@ Zotero.Schema = new function(){
 		}
 		
 		Zotero.debug('Updating user data tables from version ' + fromVersion + ' to ' + toVersion);
+		
+		if (options.onBeforeUpdate) {
+			let maybePromise = options.onBeforeUpdate({ minor: options.minor });
+			if (maybePromise && maybePromise.then) {
+				yield maybePromise;
+			}
+		}
 		
 		Zotero.DB.requireTransaction();
 		
@@ -1874,6 +2437,14 @@ Zotero.Schema = new function(){
 		for (let i = fromVersion + 1; i <= toVersion; i++) {
 			if (i == 80) {
 				yield _updateCompatibility(1);
+				
+				let userID = yield Zotero.DB.valueQueryAsync("SELECT value FROM settings WHERE setting='account' AND key='userID'");
+				if (userID && typeof userID == 'string') {
+					userID = userID.trim();
+					if (userID) {
+						yield Zotero.DB.queryAsync("UPDATE settings SET value=? WHERE setting='account' AND key='userID'", parseInt(userID));
+					}
+				}
 				
 				// Delete 'libraries' rows not in 'groups', which shouldn't exist
 				yield Zotero.DB.queryAsync("DELETE FROM libraries WHERE libraryID != 0 AND libraryID NOT IN (SELECT libraryID FROM groups)");
@@ -2346,6 +2917,159 @@ Zotero.Schema = new function(){
 					yield Zotero.DB.queryAsync("INSERT OR IGNORE INTO itemRelations VALUES (?, ?, ?)", [newSubjectID, predicateID, newObjectURI]);
 				}
 			}
+			
+			else if (i == 90) {
+				yield _updateCompatibility(4);
+				yield Zotero.DB.queryAsync("ALTER TABLE feeds RENAME TO feedsOld");
+				yield Zotero.DB.queryAsync("CREATE TABLE feeds (\n    libraryID INTEGER PRIMARY KEY,\n    name TEXT NOT NULL,\n    url TEXT NOT NULL UNIQUE,\n    lastUpdate TIMESTAMP,\n    lastCheck TIMESTAMP,\n    lastCheckError TEXT,\n    cleanupReadAfter INT,\n    cleanupUnreadAfter INT,\n    refreshInterval INT,\n    FOREIGN KEY (libraryID) REFERENCES libraries(libraryID) ON DELETE CASCADE\n)");
+				yield Zotero.DB.queryAsync("INSERT INTO feeds SELECT libraryID, name, url, lastUpdate, lastCheck, lastCheckError, 30, cleanupAfter, refreshInterval FROM feedsOld");
+				yield Zotero.DB.queryAsync("DROP TABLE feedsOld");
+			}
+			
+			else if (i == 91) {
+				yield Zotero.DB.queryAsync("ALTER TABLE libraries ADD COLUMN archived INT NOT NULL DEFAULT 0");
+			}
+			
+			else if (i == 92) {
+				let userID = yield Zotero.DB.valueQueryAsync("SELECT value FROM settings WHERE setting='account' AND key='userID'");
+				if (userID) {
+					yield Zotero.DB.queryAsync("UPDATE itemRelations SET object='http://zotero.org/users/' || ? || SUBSTR(object, 39) WHERE object LIKE ?", [userID, 'http://zotero.org/users/local/%']);
+				}
+			}
+			
+			else if (i == 93) {
+				yield _updateCompatibility(5);
+				yield Zotero.DB.queryAsync("CREATE TABLE publicationsItems (\n    itemID INTEGER PRIMARY KEY\n);");
+				yield Zotero.DB.queryAsync("INSERT INTO publicationsItems SELECT itemID FROM items WHERE libraryID=4");
+				yield Zotero.DB.queryAsync("UPDATE OR IGNORE items SET libraryID=1, synced=0 WHERE libraryID=4");
+				yield Zotero.DB.queryAsync("DELETE FROM itemRelations WHERE object LIKE ? AND object LIKE ?", ['http://zotero.org/users/%', '%/publications/items%']);
+				yield Zotero.DB.queryAsync("DELETE FROM libraries WHERE libraryID=4");
+				
+				let rows = yield Zotero.DB.queryAsync("SELECT itemID, data FROM syncCache JOIN items USING (libraryID, key, version) WHERE syncObjectTypeID=3");
+				let ids = [];
+				for (let row of rows) {
+					let json = JSON.parse(row.data);
+					if (json.data && json.data.inPublications) {
+						ids.push(row.itemID);
+					}
+				}
+				if (ids.length) {
+					yield Zotero.DB.queryAsync("INSERT INTO publicationsItems (itemID) VALUES "
+						+ ids.map(id => `(${id})`).join(', '));
+				}
+			}
+			
+			else if (i == 94) {
+				let ids = yield Zotero.DB.columnQueryAsync("SELECT itemID FROM publicationsItems WHERE itemID IN (SELECT itemID FROM items JOIN itemAttachments USING (itemID) WHERE linkMode=2)");
+				for (let id of ids) {
+					yield Zotero.DB.queryAsync("UPDATE items SET synced=0, clientDateModified=CURRENT_TIMESTAMP WHERE itemID=?", id);
+				}
+				yield Zotero.DB.queryAsync("DELETE FROM publicationsItems WHERE itemID IN (SELECT itemID FROM items JOIN itemAttachments USING (itemID) WHERE linkMode=2)");
+			}
+			
+			else if (i == 95) {
+				yield Zotero.DB.queryAsync("DELETE FROM publicationsItems WHERE itemID NOT IN (SELECT itemID FROM items WHERE libraryID=1)");
+			}
+			
+			else if (i == 96) {
+				yield Zotero.DB.queryAsync("REPLACE INTO fileTypeMIMETypes VALUES(7, 'application/vnd.ms-powerpoint')");
+			}
+			
+			else if (i == 97) {
+				let where = "WHERE predicate IN (" + Array.from(Array(20).keys()).map(i => `'${i}'`).join(', ') + ")";
+				let rows = yield Zotero.DB.queryAsync("SELECT * FROM relationPredicates " + where);
+				for (let row of rows) {
+					yield Zotero.DB.columnQueryAsync("UPDATE items SET synced=0 WHERE itemID IN (SELECT itemID FROM itemRelations WHERE predicateID=?)", row.predicateID);
+					yield Zotero.DB.queryAsync("DELETE FROM itemRelations WHERE predicateID=?", row.predicateID);
+				}
+				yield Zotero.DB.queryAsync("DELETE FROM relationPredicates " + where);
+			}
+			
+			else if (i == 98) {
+				yield Zotero.DB.queryAsync("DELETE FROM itemRelations WHERE predicateID=(SELECT predicateID FROM relationPredicates WHERE predicate='owl:sameAs') AND object LIKE ?", 'http://www.archive.org/%');
+			}
+			
+			else if (i == 99) {
+				yield Zotero.DB.queryAsync("DELETE FROM itemRelations WHERE predicateID=(SELECT predicateID FROM relationPredicates WHERE predicate='dc:isReplacedBy')");
+				yield Zotero.DB.queryAsync("DELETE FROM relationPredicates WHERE predicate='dc:isReplacedBy'");
+			}
+			
+			else if (i == 100) {
+				let userID = yield Zotero.DB.valueQueryAsync("SELECT value FROM settings WHERE setting='account' AND key='userID'");
+				let predicateID = yield Zotero.DB.valueQueryAsync("SELECT predicateID FROM relationPredicates WHERE predicate='dc:relation'");
+				if (userID && predicateID) {
+					let rows = yield Zotero.DB.queryAsync("SELECT itemID, object FROM items JOIN itemRelations IR USING (itemID) WHERE libraryID=? AND predicateID=?", [1, predicateID]);
+					for (let row of rows) {
+						let matches = row.object.match(/^http:\/\/zotero.org\/users\/(\d+)\/items\/([A-Z0-9]+)$/);
+						if (matches) {
+							// Wrong libraryID
+							if (matches[1] != userID) {
+								yield Zotero.DB.queryAsync(`UPDATE OR REPLACE itemRelations SET object='http://zotero.org/users/${userID}/items/${matches[2]}' WHERE itemID=? AND predicateID=?`, [row.itemID, predicateID]);
+							}
+						}
+					}
+				}
+			}
+			
+			else if (i == 101) {
+				Components.utils.import("chrome://zotero/content/import/mendeley/mendeleyImport.js");
+				let importer = new Zotero_Import_Mendeley();
+				if (yield importer.hasImportedFiles()) {
+					yield importer.queueFileCleanup();
+				}
+			}
+			
+			else if (i == 102) {
+				let userID = yield Zotero.DB.valueQueryAsync("SELECT value FROM settings WHERE setting='account' AND key='userID'");
+				if (userID && typeof userID == 'string') {
+					userID = userID.trim();
+					if (userID) {
+						yield Zotero.DB.queryAsync("UPDATE settings SET value=? WHERE setting='account' AND key='userID'", parseInt(userID));
+					}
+				}
+			}
+			
+			// Duplicated in retractions.js::init() due to undiagnosed schema update bug
+			else if (i == 105) {
+				// This was originally in 103 and then 104, but some schema update steps are being
+				// missed for some people, so run again with IF NOT EXISTS until we figure out
+				// what's going on.
+				yield Zotero.DB.queryAsync("CREATE TABLE IF NOT EXISTS retractedItems (\n	itemID INTEGER PRIMARY KEY,\n	data TEXT,\n	FOREIGN KEY (itemID) REFERENCES items(itemID) ON DELETE CASCADE\n);");
+				
+				yield Zotero.DB.queryAsync("ALTER TABLE retractedItems ADD COLUMN flag INT DEFAULT 0");
+			}
+			
+			else if (i == 106) {
+				yield _updateCompatibility(6);
+				
+				yield Zotero.DB.queryAsync("DROP TRIGGER IF EXISTS insert_date_field");
+				yield Zotero.DB.queryAsync("DROP TRIGGER IF EXISTS update_date_field");
+				yield Zotero.DB.queryAsync("DROP TRIGGER IF EXISTS fki_itemAttachments");
+				yield Zotero.DB.queryAsync("DROP TRIGGER IF EXISTS fku_itemAttachments");
+				yield Zotero.DB.queryAsync("DROP TRIGGER IF EXISTS fki_itemNotes");
+				yield Zotero.DB.queryAsync("DROP TRIGGER IF EXISTS fku_itemNotes");
+				
+				yield Zotero.DB.queryAsync("DROP TABLE IF EXISTS transactionSets");
+				yield Zotero.DB.queryAsync("DROP TABLE IF EXISTS transactions");
+				yield Zotero.DB.queryAsync("DROP TABLE IF EXISTS transactionLog");
+			}
+			
+			else if (i == 107) {
+				if (!(yield Zotero.DB.valueQueryAsync("SELECT COUNT(*) FROM itemTypes"))) {
+					let sql = yield _getSchemaSQL('system-107');
+					yield Zotero.DB.executeSQLFile(sql);
+				}
+			}
+			
+			else if (i == 108) {
+				yield Zotero.DB.queryAsync(`DELETE FROM itemRelations WHERE predicateID=(SELECT predicateID FROM relationPredicates WHERE predicate='owl:sameAs') AND object LIKE ?`, 'http://zotero.org/users/local/%');
+			}
+			
+			else if (i == 109) {
+				yield Zotero.DB.queryAsync("CREATE TABLE dbDebug1 (\n    a INTEGER PRIMARY KEY\n)");
+			}
+			
+			// If breaking compatibility or doing anything dangerous, clear minorUpdateFrom
 		}
 		
 		yield _updateDBVersion('userdata', toVersion);
@@ -2410,7 +3134,7 @@ Zotero.Schema = new function(){
 			}
 			else {
 				let file = Components.classes["@mozilla.org/file/local;1"]
-					.createInstance(Components.interfaces.nsILocalFile);
+					.createInstance(Components.interfaces.nsIFile);
 				try {
 					file.persistentDescriptor = path;
 				}

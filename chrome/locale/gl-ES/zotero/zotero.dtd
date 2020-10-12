@@ -10,11 +10,20 @@
 <!ENTITY zotero.general.cancel "Cancelar">
 <!ENTITY zotero.general.refresh "Actualizar">
 <!ENTITY zotero.general.saveAs "Gardar como...">
+<!ENTITY zotero.general.options "Opcións">
 <!ENTITY zotero.general.advancedOptions.label "Opcións avanzadas">
+<!ENTITY zotero.general.tools "Ferramentas">
 <!ENTITY zotero.general.more "Máis">
+<!ENTITY zotero.general.loading "Cargando...">
+<!ENTITY zotero.general.close "Pechar">
+<!ENTITY zotero.general.minimize "Minimizar">
+<!ENTITY zotero.general.other "Outros...">
+<!ENTITY zotero.general.bigger "Máis grande">
+<!ENTITY zotero.general.smaller "Máis pequeno">
+<!ENTITY zotero.general.reset "Reiniciar">
+
 
 <!ENTITY zotero.errorReport.title "Informe de erros de Zotero">
-<!ENTITY zotero.errorReport.unrelatedMessages "Isto pode conter mensaxes que non estean relacionadas con Zotero.">
 <!ENTITY zotero.errorReport.submissionInProgress "Espera mentres que se presenta o informe de erro.">
 <!ENTITY zotero.errorReport.submitted "Presentouse o informe de erro.">
 <!ENTITY zotero.errorReport.reportID "ID do informe:">
@@ -35,11 +44,6 @@
 <!ENTITY zotero.upgrade.changeLogLink "o rexistro de cambios">
 <!ENTITY zotero.upgrade.changeLogAfterLink "para saber que hai de novo.">
 
-<!ENTITY zotero.contextMenu.addTextToCurrentNote "Engadir a selección a unha nota de Zotero">
-<!ENTITY zotero.contextMenu.addTextToNewNote "Crear un elemento e un nota de Zotero a partir da selección">
-<!ENTITY zotero.contextMenu.saveLinkAsItem "Gardar a ligazón como un elemento de Zotero">
-<!ENTITY zotero.contextMenu.saveImageAsItem "Gardar a imaxe como un elemento de Zotero">
-
 <!ENTITY zotero.tabs.info.label "Información">
 <!ENTITY zotero.tabs.notes.label "Notas">
 <!ENTITY zotero.tabs.attachments.label "Anexo">
@@ -49,6 +53,7 @@
 
 <!ENTITY zotero.toolbar.duplicate.label "Mostrar os duplicados">
 <!ENTITY zotero.collections.showUnfiledItems "Mostrar os elementos sen cubrir">
+<!ENTITY zotero.collections.showRetractedItems "Mostrar elementos descartados">
 
 <!ENTITY zotero.items.itemType "Tipo de elemento">
 <!ENTITY zotero.items.type_column "Tipo de elemento">
@@ -86,8 +91,6 @@
 <!ENTITY zotero.items.menu.showInLibrary "Amosar na biblioteca">
 <!ENTITY zotero.items.menu.attach.note "Engadir unha nota">
 <!ENTITY zotero.items.menu.attach "Engadir un anexo">
-<!ENTITY zotero.items.menu.attach.snapshot "Anexar unha instantánea da páxina actual">
-<!ENTITY zotero.items.menu.attach.link "Anexar a ligazón á páxina actual">
 <!ENTITY zotero.items.menu.attach.link.uri "Anexar a ligazón ao URI...">
 <!ENTITY zotero.items.menu.attach.file "Anexar a copia almacenada do ficheiro...">
 <!ENTITY zotero.items.menu.attach.fileLink "Anexar a ligazón do ficheiro...">
@@ -95,16 +98,17 @@
 <!ENTITY zotero.items.menu.restoreToLibrary "Restaurar na biblioteca">
 <!ENTITY zotero.items.menu.duplicateItem "Duplicar os elementos seleccionados">
 <!ENTITY zotero.items.menu.mergeItems "Xunguir os elemento...">
+<!ENTITY zotero.items.menu.unrecognize "Desfacer a recuperación de metadatos">
+<!ENTITY zotero.items.menu.reportMetadata "Informar de erros nos metadatos">
 
 <!ENTITY zotero.duplicatesMerge.versionSelect "Escolle que versión deste elemento queres usar como o principal:">
 <!ENTITY zotero.duplicatesMerge.fieldSelect "Escolle os campos a manter das outras versións do elemento:">
 
 <!ENTITY zotero.toolbar.newItem.label "Novo elemento">
 <!ENTITY zotero.toolbar.moreItemTypes.label "Máis">
-<!ENTITY zotero.toolbar.newItemFromPage.label "Crear un novo elemento a partir desta páxina">
 <!ENTITY zotero.toolbar.lookup.label "Engadir un elemento polo identificador">
 <!ENTITY zotero.toolbar.removeItem.label "Eliminar...">
-<!ENTITY zotero.toolbar.newLibrary.label "Nova biblioteca...">
+<!ENTITY zotero.toolbar.newLibrary.label "Nova biblioteca">
 <!ENTITY zotero.toolbar.newCollection.label "Colección nova">
 <!ENTITY zotero.toolbar.markFeedRead.label "Marcar a fonte de novas como lida">
 <!ENTITY zotero.toolbar.newGroup "Grupo novo...">
@@ -116,19 +120,17 @@
 <!ENTITY zotero.toolbar.import.label "Importar...">
 <!ENTITY zotero.toolbar.importFromClipboard "Importar do portaretallos">
 <!ENTITY zotero.toolbar.export.label "Exportar a biblioteca...">
-<!ENTITY zotero.toolbar.rtfScan.label "Escáner RTF">
+<!ENTITY zotero.toolbar.rtfScan.label "Esculcar RTF">
 <!ENTITY zotero.toolbar.timeline.label "Crear un cronograma">
 <!ENTITY zotero.toolbar.preferences.label "Preferencias...">
 <!ENTITY zotero.toolbar.supportAndDocumentation "Axuda e documentación">
 <!ENTITY zotero.toolbar.about.label "Acerca de Zotero">
 <!ENTITY zotero.toolbar.advancedSearch "Busca avanzada">
-<!ENTITY zotero.toolbar.tab.tooltip "Cambiar o modo de lingüetas">
 <!ENTITY zotero.toolbar.openURL.label "Localizar">
 <!ENTITY zotero.toolbar.openURL.tooltip "Atopar na súa biblioteca local">
 
-<!ENTITY zotero.toolbar.feeds.new "Nova fonte de novas...">
+<!ENTITY zotero.toolbar.feeds.new "Nova fonte de novas">
 <!ENTITY zotero.toolbar.feeds.new.fromURL "Desde a URL...">
-<!ENTITY zotero.toolbar.feeds.new.fromPage "Desde a páxina...">
 <!ENTITY zotero.toolbar.feeds.new.fromOPML "Desde a OPML...">
 <!ENTITY zotero.toolbar.feeds.refresh "Actualizar as novas">
 <!ENTITY zotero.toolbar.feeds.edit "Editar a fonte de novas...">
@@ -143,6 +145,8 @@
 <!ENTITY zotero.item.copyAsURL "Gardar como URL">
 <!ENTITY zotero.item.deletePermanently "Eliminar ao completo...">
 
+<!ENTITY zotero.item.tags.removeAll "Eliminar todas as etiquetas...">
+
 <!ENTITY zotero.toolbar.newNote "Nota nova">
 <!ENTITY zotero.toolbar.note.standalone "Nova nota independente">
 <!ENTITY zotero.toolbar.note.child "Engadir unha nota filla">
@@ -156,6 +160,7 @@
 <!ENTITY zotero.tagSelector.loadingTags "Cargando as etiquetas...">
 <!ENTITY zotero.tagSelector.showAutomatic "Mostrar automaticamente">
 <!ENTITY zotero.tagSelector.displayAllInLibrary "Mostrar todas as etiquetas nesta librería">
+<!ENTITY zotero.tagSelector.deleteAutomaticInLibrary "Borrar as etiquetas desta librería automaticamente...">
 <!ENTITY zotero.tagSelector.clearAll "Desmarcar todo">
 <!ENTITY zotero.tagSelector.assignColor "Asignarlle cor...">
 <!ENTITY zotero.tagSelector.renameTag "Renomear a etiqueta...">
@@ -167,7 +172,7 @@
 <!ENTITY zotero.tagColorChooser.setColor "Definir a cor">
 <!ENTITY zotero.tagColorChooser.removeColor "Eliminar a cor">
 
-<!ENTITY zotero.lookup.description "Introduza na caixa de debaixo un ISBN, un DOI ou un PMID que buscar.">
+<!ENTITY zotero.lookup.description "Introduce ISBNs, DOIs, PMIDs, ou IDs de arXiv IDs para engadilos na librería:">
 <!ENTITY zotero.lookup.button.search "Buscar">
 
 <!ENTITY zotero.selectitems.title "Seleccionar elementos">
@@ -193,6 +198,16 @@
 <!ENTITY zotero.integration.quickFormatDialog.title "Formato rápido de citación">
 
 <!ENTITY zotero.progress.title "Progreso">
+
+<!ENTITY zotero.import "Importar">
+<!ENTITY zotero.import.whereToImportFrom "De onde queres importar?">
+<!ENTITY zotero.import.source.file "Un ficheiro (BibTeX, RIS, Zotero RDF, etc.)">
+<!ENTITY zotero.import.importing "Importando...">
+<!ENTITY zotero.import.database "Base de datos">
+<!ENTITY zotero.import.lastModified "Última modificación">
+<!ENTITY zotero.import.size "Tamaño">
+<!ENTITY zotero.import.createCollection "Poñer as coleccións e elementos importados nunha nova colección">
+<!ENTITY zotero.import.fileHandling "Xestión de ficheiros">
 
 <!ENTITY zotero.exportOptions.title "Exportar...">
 <!ENTITY zotero.exportOptions.format.label "Formato:">
@@ -224,22 +239,25 @@
 <!ENTITY zotero.integration.prefs.footnotes.label "Notas ao pé de páxina">
 <!ENTITY zotero.integration.prefs.endnotes.label "Notas no rodapé">
 
-<!ENTITY zotero.integration.prefs.formatUsing.label "Utilizando o formato:">
+<!ENTITY zotero.integration.prefs.formatUsing.label "Gardar as citas como:">
 <!ENTITY zotero.integration.prefs.bookmarks.label "Marcador">
-<!ENTITY zotero.integration.prefs.bookmarks.caption "Os marcadores consérvanse a través de e LibreOffice e Microsoft Word pero poden ser modificados accidentalmente. Por motivos de compatibilidade, as citas non se insiren nas notas a final de páxina ou nos rodapés cando se activa esa opción.">
+<!ENTITY zotero.integration.prefs.bookmarks.caption "Os marcapáxinas pódense compartir entre Word e LibreOffice. Porén, se se modifican por erro xa non se poden introducir nas notas ao pé do texto.">
 
+<!ENTITY zotero.integration.prefs.automaticCitationUpdates.label "Actualizar as citas automaticamente">
+<!ENTITY zotero.integration.prefs.automaticCitationUpdates.tooltip "Vanse marcar as citas con actualizacións pendentes no documento">
+<!ENTITY zotero.integration.prefs.automaticCitationUpdates.description "Desactivar as actualizacións pode acelerar a introdución de citas nos documentos grandes. Preme en refrescar para actualizar as citas de xeito manual.">
 
-<!ENTITY zotero.integration.prefs.automaticJournalAbbeviations.label "Abreviar os títulos de revistas de maneira automática">
-<!ENTITY zotero.integration.prefs.automaticJournalAbbeviations.caption "As abreviaturas das revistas de MEDLINE xeraranse automaticamente empregando os títulos das revistas. O campo «Abrev revista» ignórase.">
+<!ENTITY zotero.integration.prefs.automaticJournalAbbeviations.label "Empregar as abreviaturas de MEDLINE">
+<!ENTITY zotero.integration.prefs.automaticJournalAbbeviations.caption "O campo «Abrv. Xornal» hase ignorar. ">
 
-<!ENTITY zotero.integration.prefs.storeReferences.label "Almacenar as referencias no documento">
-<!ENTITY zotero.integration.prefs.storeReferences.caption "Almacenar as referencias no documento supón un aumento no peso do ficheiro mais permitirache compartir o documento sen ter que empregar ningún grupo de Zotero. Precísase ter Zotero 3.0 ou as seguintes versións para actualizar os ficheiros que se crearon con esta opción.">
+<!ENTITY zotero.integration.prefs.exportDocument "Mudar a outro editor de textos...">
 
 <!ENTITY zotero.integration.showEditor.label "Mostrar o editor">
 <!ENTITY zotero.integration.classicView.label "Vista clásica">
 
 <!ENTITY zotero.integration.references.label "Referencias en bibliografía">
 
+<!ENTITY zotero.sync.stop "Deter a sincronización">
 <!ENTITY zotero.sync.error "Erro de sincronización">
 <!ENTITY zotero.sync.storage.progress "Progreso:">
 <!ENTITY zotero.sync.storage.downloads "Descargas:">
@@ -271,16 +289,12 @@
 <!ENTITY zotero.feedSettings.title.label "Título:">
 <!ENTITY zotero.feedSettings.refresh.label1 "Actualizar todas as fontes">
 <!ENTITY zotero.feedSettings.refresh.label2 "hora(s)">
-<!ENTITY zotero.feedSettings.cleanupAfter.label1 "Despois eliminar os artigos lidos">
-<!ENTITY zotero.feedSettings.cleanupAfter.label2 "día(s)">
+<!ENTITY zotero.feedSettings.cleanupUnreadAfter.label1 "Borrar os elementos sen ler despois de">
+<!ENTITY zotero.feedSettings.cleanupUnreadAfter.label2 "día(s)">
+<!ENTITY zotero.feedSettings.cleanupReadAfter.label1 "Borrar os elementos sen ler despois de">
+<!ENTITY zotero.feedSettings.cleanupReadAfter.label2 "día(s)">
 
-
-<!ENTITY zotero.recognizePDF.recognizing.label "Recuperando metadatos ...">
-<!ENTITY zotero.recognizePDF.cancel.label "Cancelar">
-<!ENTITY zotero.recognizePDF.pdfName.label "Nome do PDF">
-<!ENTITY zotero.recognizePDF.itemName.label "Nome do elemento">
-
-<!ENTITY zotero.rtfScan.title "Analizador de RTF">
+<!ENTITY zotero.rtfScan.title "Esculcar RTF">
 <!ENTITY zotero.rtfScan.cancel.label "Cancelar">
 <!ENTITY zotero.rtfScan.citation.label "Cita">
 <!ENTITY zotero.rtfScan.itemName.label "Nome do elemento">
@@ -288,26 +302,22 @@
 <!ENTITY zotero.rtfScan.ambiguousCitations.label "Citas ambiguas">
 <!ENTITY zotero.rtfScan.mappedCitations.label "Citas cotexadas">
 <!ENTITY zotero.rtfScan.introPage.label "Introdución">
-<!ENTITY zotero.rtfScan.introPage.description "Zotero pode extraer e reformatear automaticamente citas e inserir a bibliografía en ficheiros RTF. O analizador de RTFs soporta as citas con variacións nos seguintes formatos:">
+<!ENTITY zotero.rtfScan.introPage.description "Zotero pode extraer e darlle automaticamente novo formato ás citas e inserir a bibliografía en ficheiros RTF. O esculcador de RTFs acepta as citas con variacións nos seguintes formatos:">
 <!ENTITY zotero.rtfScan.introPage.description2 "Para comezar escolla abaixo un ficheiro RTF de entrada e un ficheiro de saída:">
 <!ENTITY zotero.rtfScan.scanPage.label "Esculcando as citas">
-<!ENTITY zotero.rtfScan.scanPage.description "Zotero está esculdando as citas dos seus documentos. Agarda.">
+<!ENTITY zotero.rtfScan.scanPage.description "Zotero está esculcando as citas dos seus documentos. Agarda.">
 <!ENTITY zotero.rtfScan.citationsPage.label "Comproba os elementos citados">
 <!ENTITY zotero.rtfScan.citationsPage.description "Revisa a lista de citas recoñecidas de abaixo para asegurarse de que se escolleron os elementos correctos. As citas non cotexadas ou ambiguas deben ser resoltas antes de continuar co seguinte paso.">
 <!ENTITY zotero.rtfScan.stylePage.label "Formato de documentos">
 <!ENTITY zotero.rtfScan.formatPage.label "Formato de citas">
 <!ENTITY zotero.rtfScan.formatPage.description "Zotero está procesando e dando formato ao arquivo RTF. Agarde.">
-<!ENTITY zotero.rtfScan.completePage.label "Esculca completa do RTF">
+<!ENTITY zotero.rtfScan.completePage.label "Esculcado completo do RTF">
 <!ENTITY zotero.rtfScan.completePage.description "O seu documento xa foi esculcado e procesado. Asegúrate de que o formato é correcto.">
 <!ENTITY zotero.rtfScan.inputFile.label "Ficheiro de entrada">
 <!ENTITY zotero.rtfScan.outputFile.label "Ficheiro de saída">
 
 <!ENTITY zotero.file.choose.label "Escoller ficheiro...">
 <!ENTITY zotero.file.noneSelected.label "Ningún ficheiro seleccionado">
-
-<!ENTITY zotero.downloadManager.label "Gardar">
-<!ENTITY zotero.downloadManager.saveToLibrary.description "Os anexos non se poden gardar na librería que se escolleu. En vez de alí, ese documento gardarase na biblioteca.">
-<!ENTITY zotero.downloadManager.noPDFTools.description "Para empregar esta característica ten que instalar primeiro as ferramentas de PDF desde «preferencias».">
 
 <!ENTITY zotero.attachLink.title "Engadirlle unha ligazón á URI:">
 <!ENTITY zotero.attachLink.label.link "Ligazón:">

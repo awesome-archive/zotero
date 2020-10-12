@@ -1,5 +1,7 @@
 describe("Advanced Preferences", function () {
-	describe("General", function () {
+	// TODO: Debug output logging is now in the application menus, and we test in Firefox...
+	// Maybe add the debug output menu to Firefox for the purposes of testing?
+	describe.skip("General", function () {
 		var server;
 		
 		before(function () {
@@ -159,8 +161,9 @@ describe("Advanced Preferences", function () {
 					Zotero.Attachments.BASE_PATH_PLACEHOLDER + 'test.png'
 				);
 				
-				var basePath = Zotero.getTempDirectory().path;
-				yield setBaseDirectory(basePath);
+				// Choose a nonexistent directory for the base path
+				var otherPath = OS.Path.join(OS.Path.dirname(basePath), 'foobar');
+				yield setBaseDirectory(otherPath);
 				
 				assert.equal(attachment.attachmentPath, file.path);
 			})
